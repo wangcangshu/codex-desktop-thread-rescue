@@ -1,0 +1,435 @@
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from .unstick_thread import (
+        append_abort_events,
+        backup_files,
+        connect_sqlite,
+        inspect_thread,
+        select_latest_thread,
+        update_thread_timestamp,
+    )
+except ImportError:
+    from unstick_thread import (
+        append_abort_events,
+        backup_files,
+        connect_sqlite,
+        inspect_thread,
+        select_latest_thread,
+        update_thread_timestamp,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Conservative auto-repair for stuck Codex threads with orphan task_started state."
+    )
+    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--workspace-filter", default="")
+    parser.add_argument("--min-open-seconds", type=int, default=600)
+    parser.add_argument("--observe-seconds", type=int, default=120)
+    parser.add_argument("--cooldown-seconds", type=int, default=1800)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--allow-live-repair", action="store_true")
+    parser.add_argument("--node-command", default="node")
+    parser.add_argument("--ipc-timeout-ms", type=int, default=12000)
+    parser.add_argument("--ipc-settle-seconds", type=int, default=8)
+    parser.add_argument("--force-on-first-observation", action="store_true")
+    return parser.parse_args()
+
+
+def now_s() -> int:
+    return int(time.time())
+
+
+def is_codex_running() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Process | Where-Object { $_.ProcessName -in @('Codex','codex') } | Select-Object -First 1 -ExpandProperty Id",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+@contextmanager
+def file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = None
+    acquired = False
+    try:
+        if lock_path.exists():
+            age = time.time() - lock_path.stat().st_mtime
+            if age > 3600:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        acquired = True
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if acquired:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fingerprint(info: dict) -> str:
+    open_turn = info.get("open_turn") or {}
+    return "|".join(
+        [
+            info.get("thread_id", ""),
+            open_turn.get("turn_id", ""),
+            str(open_turn.get("line", "")),
+            str(info.get("rollout_size_bytes", "")),
+            str(info.get("rollout_mtime_ns", "")),
+        ]
+    )
+
+
+def append_action_log(path: Path, entry: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def parse_json_line(text: str):
+    for line in reversed([line.strip() for line in text.splitlines() if line.strip()]):
+        try:
+            return json.loads(line)
+        except Exception:
+            continue
+    return None
+
+
+def run_live_interrupt(
+    *,
+    thread_id: str,
+    node_command: str,
+    timeout_ms: int,
+) -> dict:
+    helper_path = Path(__file__).resolve().parent / "codex_ipc_control.js"
+    if not helper_path.exists():
+        return {
+            "ok": False,
+            "error": "missing_helper",
+            "helper_path": str(helper_path),
+        }
+
+    command = [
+        node_command,
+        str(helper_path),
+        "interrupt",
+        thread_id,
+        "--timeout-ms",
+        str(timeout_ms),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(10, int(timeout_ms / 1000) + 5),
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "spawn_failed",
+            "command": command,
+            "exception": str(exc),
+        }
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    payload = parse_json_line(stdout)
+
+    return {
+        "ok": bool(result.returncode == 0 and isinstance(payload, dict) and payload.get("status") == "success"),
+        "command": command,
+        "exit_code": result.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "payload": payload,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    codex_home = Path(args.codex_home).expanduser()
+    output_dir = Path(args.output_dir).expanduser()
+    state_dir = output_dir / "state"
+    observation_path = state_dir / "auto_repair_observations.json"
+    action_log_path = output_dir / "auto_repair_actions.jsonl"
+    lock_path = state_dir / "auto_repair.lock"
+    state_db = codex_home / "state_5.sqlite"
+
+    report = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "workspace_filter": args.workspace_filter,
+        "apply": args.apply,
+        "allow_live_repair": args.allow_live_repair,
+        "status": "unknown",
+        "decision": "none",
+    }
+
+    if not state_db.exists():
+        report["status"] = "missing_state_db"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 20
+
+    try:
+        with file_lock(lock_path):
+            observations = load_json(observation_path, {})
+            conn = connect_sqlite(state_db)
+            try:
+                thread = select_latest_thread(conn, args.workspace_filter)
+            finally:
+                conn.close()
+
+            if not thread:
+                report["status"] = "no_thread"
+                save_json(observation_path, observations)
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            rollout_path = Path(thread["rollout_path"])
+            if not rollout_path.exists():
+                report["status"] = "missing_rollout"
+                report["thread_id"] = thread["id"]
+                save_json(observation_path, observations)
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            info = inspect_thread(thread, rollout_path)
+            report["thread_id"] = info["thread_id"]
+            report["title"] = info["title"]
+            report["rollout_path"] = info["rollout_path"]
+            report["inspect_status"] = info["status"]
+            report["open_turn"] = info.get("open_turn")
+
+            thread_id = info["thread_id"]
+            current_fp = fingerprint(info)
+            existing = observations.get(thread_id)
+            current_time = now_s()
+
+            if info["status"] != "orphan_task_started":
+                report["status"] = "healthy"
+                report["decision"] = "clear_observation"
+                if thread_id in observations:
+                    observations.pop(thread_id, None)
+                    save_json(observation_path, observations)
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            open_turn = info["open_turn"] or {}
+            started_at = int(open_turn.get("started_at") or 0)
+            open_age = max(0, current_time - started_at) if started_at else None
+            report["open_age_seconds"] = open_age
+
+            if not existing or existing.get("fingerprint") != current_fp:
+                observations[thread_id] = {
+                    "fingerprint": current_fp,
+                    "first_seen_at": current_time,
+                    "last_seen_at": current_time,
+                    "last_repaired_at": existing.get("last_repaired_at") if existing else None,
+                }
+                save_json(observation_path, observations)
+                existing = observations[thread_id]
+                if not args.force_on_first_observation:
+                    report["status"] = "observing"
+                    report["decision"] = "wait_for_second_observation"
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
+                    return 0
+
+            existing["last_seen_at"] = current_time
+            observed_for = current_time - int(existing.get("first_seen_at") or current_time)
+            report["observed_for_seconds"] = observed_for
+
+            if open_age is not None and open_age < int(args.min_open_seconds):
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+                report["status"] = "observing"
+                report["decision"] = "open_turn_too_young"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            if observed_for < int(args.observe_seconds):
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+                report["status"] = "observing"
+                report["decision"] = "waiting_stability_window"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            last_repaired_at = int(existing.get("last_repaired_at") or 0)
+            cooldown_left = (last_repaired_at + int(args.cooldown_seconds)) - current_time
+            if last_repaired_at and cooldown_left > 0:
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+                report["status"] = "cooldown"
+                report["decision"] = "skip_recent_repair"
+                report["cooldown_left_seconds"] = cooldown_left
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            codex_running = is_codex_running()
+            report["codex_running"] = codex_running
+            if codex_running and not args.allow_live_repair:
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+                report["status"] = "blocked"
+                report["decision"] = "codex_running_live_repair_disabled"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            if not args.apply:
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+                report["status"] = "repairable_live" if codex_running else "repairable"
+                report["decision"] = "dry_run_only_live_interrupt" if codex_running else "dry_run_only"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            if codex_running and args.allow_live_repair:
+                live_result = run_live_interrupt(
+                    thread_id=thread_id,
+                    node_command=args.node_command,
+                    timeout_ms=args.ipc_timeout_ms,
+                )
+                report["live_ipc"] = live_result
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+
+                if not live_result.get("ok"):
+                    report["status"] = "live_interrupt_failed"
+                    report["decision"] = "ipc_interrupt_failed"
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
+                    return 0
+
+                existing["last_repaired_at"] = current_time
+                existing["last_repaired_turn_id"] = open_turn["turn_id"]
+                existing["last_live_interrupt_at"] = current_time
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+
+                action = {
+                    "timestamp": report["timestamp"],
+                    "thread_id": thread_id,
+                    "title": report["title"],
+                    "turn_id": open_turn["turn_id"],
+                    "repair": {
+                        "mode": "ipc_interrupt",
+                        "result": live_result,
+                    },
+                    "workspace_filter": args.workspace_filter,
+                    "live_repair": True,
+                }
+                append_action_log(action_log_path, action)
+
+                if args.ipc_settle_seconds > 0:
+                    time.sleep(args.ipc_settle_seconds)
+
+                post_info = inspect_thread(thread, rollout_path)
+                report["post_interrupt_status"] = post_info["status"]
+                report["post_interrupt_open_turn"] = post_info.get("open_turn")
+                report["action"] = action
+                if post_info["status"] != "orphan_task_started":
+                    report["status"] = "repaired"
+                    report["decision"] = "ipc_interrupt"
+                else:
+                    report["status"] = "live_interrupt_sent"
+                    report["decision"] = "ipc_interrupt_waiting_followup"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_dir = output_dir / "backups" / thread_id / stamp
+            rollout_backup, state_backup = backup_files(backup_dir, rollout_path, state_db)
+            append_info = append_abort_events(
+                rollout_path=rollout_path,
+                turn_id=open_turn["turn_id"],
+                started_at=open_turn.get("started_at"),
+            )
+            update_thread_timestamp(
+                state_db=state_db,
+                thread_id=thread_id,
+                completed_at=append_info["completed_at"],
+                completed_at_ms=append_info["completed_at_ms"],
+            )
+
+            existing["last_repaired_at"] = current_time
+            existing["last_repaired_turn_id"] = open_turn["turn_id"]
+            observations[thread_id] = existing
+            save_json(observation_path, observations)
+
+            action = {
+                "timestamp": report["timestamp"],
+                "thread_id": thread_id,
+                "title": report["title"],
+                "turn_id": open_turn["turn_id"],
+                "backup_dir": str(backup_dir),
+                "backup_rollout": str(rollout_backup),
+                "backup_state_db": str(state_backup),
+                "repair": append_info,
+                "workspace_filter": args.workspace_filter,
+                "live_repair": bool(codex_running),
+            }
+            append_action_log(action_log_path, action)
+
+            report["status"] = "repaired"
+            report["decision"] = "appended_turn_aborted"
+            report["action"] = action
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+    except FileExistsError:
+        report["status"] = "busy"
+        report["decision"] = "lock_held"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
