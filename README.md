@@ -2,6 +2,16 @@
 
 Focused on one specific issue: Codex Desktop threads getting stuck on automatic context compaction.
 
+> Important UI refresh tip:
+> If the tool reports success and you already see a completion notice, but the chat window still says automatic context compaction, do not restart immediately.
+> Go back to the same chat, send a short message such as `continue`, and wait a moment.
+> In some cases this is enough to refresh the frontend and reveal that compaction has already completed.
+
+> 重要前端刷新提示：
+> 如果工具已经提示修复成功，右下角也弹出了完成提醒，但聊天窗口还停在“正在自动压缩上下文”，先不要急着重启。
+> 请回到原聊天里随便发一句简单的话，比如 `继续`，然后稍微等一会。
+> 有些情况下，这一步就足以刷新前端，让已经完成的压缩结果显示出来。
+
 聚焦一个具体问题：Codex 桌面版对话卡在“自动压缩上下文”并长时间无响应。
 
 ## What Problem This Targets
@@ -104,6 +114,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 
 - Do not restart immediately just because you see automatic context compaction.
 - Refresh the thread list first and see whether the thread really looks stuck.
+- If the tool reports success but the chat UI still says automatic context compaction, send a very short follow-up such as "continue" in that same chat and wait a moment before trying anything more drastic.
 - If the terminal already succeeded but the desktop UI still shows the old state, try sending a very simple message such as "hi" or "continue" in that chat.
 - If that still does not refresh the UI, switch to another conversation and then switch back.
 - Avoid mixing restart, model switching, branching, and terminal compaction randomly, because it makes the failure harder to understand.

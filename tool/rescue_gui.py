@@ -45,6 +45,11 @@ DEFAULT_STUCK_SECONDS = 180
 DEFAULT_SETTLE_SECONDS = 6
 DEFAULT_TIMEOUT_MS = 12000
 
+FRONTEND_REFRESH_TIP = bi(
+    "重要提示：如果工具已经修复成功，右下角也提示完成，但聊天窗口还停在“正在自动压缩上下文”，先不要急着重启。请回到原聊天里随便发一句简单的话，比如“继续”，然后稍微等一会。前端通常会刷新，并显示上下文其实已经压缩完成。",
+    "Important: if the tool already reports success but the chat window still shows automatic context compaction, do not restart immediately. Go back to the original chat, send a short message such as 'continue', then wait a moment. The frontend often refreshes and shows that compaction has already finished.",
+)
+
 STATUS_TEXT = {
     "healthy": bi("正常", "Healthy"),
     "stuck": bi("可能卡死", "Likely Stuck"),
@@ -416,7 +421,7 @@ class RescueApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
         controls = ttk.Frame(self.root, padding=12)
         controls.grid(row=0, column=0, sticky="ew")
@@ -471,8 +476,18 @@ class RescueApp:
         ttk.Button(controls, text=bi("复制线程 ID", "Copy Thread ID"), command=self.copy_thread_id).grid(row=2, column=6, sticky="ew", pady=(10, 0))
         ttk.Button(controls, text=bi("打开 Rollout 文件", "Open Rollout"), command=self.open_rollout).grid(row=2, column=7, sticky="ew", padx=(8, 0), pady=(10, 0))
 
+        tip_frame = ttk.LabelFrame(self.root, text=bi("重要提示", "Important Tip"), padding=(12, 8))
+        tip_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        tip_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            tip_frame,
+            text=FRONTEND_REFRESH_TIP,
+            justify="left",
+            wraplength=1220,
+        ).grid(row=0, column=0, sticky="w")
+
         panes = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
-        panes.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        panes.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
         left = ttk.Frame(panes)
         left.columnconfigure(0, weight=1)
@@ -528,7 +543,7 @@ class RescueApp:
         self.details.configure(yscrollcommand=details_scroll.set)
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(12, 6))
-        status_bar.grid(row=2, column=0, sticky="ew")
+        status_bar.grid(row=3, column=0, sticky="ew")
 
     def selected_row(self) -> ThreadSummary | None:
         selection = self.tree.selection()
@@ -658,6 +673,14 @@ class RescueApp:
             ]
         )
 
+        detail_lines.extend(
+            [
+                "",
+                bi("前端刷新提示", "Frontend Refresh Tip") + ":",
+                FRONTEND_REFRESH_TIP,
+            ]
+        )
+
         self.details.configure(state="normal")
         self.details.delete("1.0", tk.END)
         self.details.insert("1.0", "\n".join(detail_lines))
@@ -717,6 +740,9 @@ class RescueApp:
         )
         self.details.see(tk.END)
         self.details.configure(state="disabled")
+
+        if status in {"repaired_live", "repaired_fallback", "repaired_fallback_after_live"}:
+            messagebox.showinfo(APP_TITLE, FRONTEND_REFRESH_TIP)
 
         self.refresh_threads()
 
