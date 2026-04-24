@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,7 @@ try:
         live_failure_can_fallback,
         run_live_interrupt_until_stable,
     )
+    from .external_compact_fallback import run_external_compact_fallback
     from .unstick_thread import (
         append_abort_events_many,
         backup_files,
@@ -35,6 +38,7 @@ except ImportError:
         live_failure_can_fallback,
         run_live_interrupt_until_stable,
     )
+    from external_compact_fallback import run_external_compact_fallback
     from unstick_thread import (
         append_abort_events_many,
         backup_files,
@@ -66,6 +70,9 @@ STATUS_TEXT = {
     "active": bi("有未完成回合", "Open Turn"),
     "error": bi("检查失败", "Inspect Error"),
 }
+
+COMPACT_HTTP_STATUS_RE = re.compile(r"http\.response\.status_code=(\d+)")
+COMPACT_SEND_ERROR_TEXT = "error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)"
 
 
 def utc_timestamp() -> str:
@@ -139,7 +146,290 @@ class ThreadSummary:
     rollout_idle_seconds: int | None
     open_turn: dict | None
     open_turns: list[dict]
+    compact_event_count: int
+    compact_http_500_count: int
+    compact_send_error_count: int
+    compact_state_label: str
+    compact_state_time_text: str
+    compact_state_detail: str
+    risk_label: str
+    risk_rank: str
+    risk_reason: str
     raw_thread: dict
+
+
+def load_thread_compact_stats(codex_home: Path, thread_id: str) -> dict:
+    logs_db = codex_home / "logs_2.sqlite"
+    stats = {
+        "compact_event_count": 0,
+        "compact_http_500_count": 0,
+        "compact_send_error_count": 0,
+    }
+    if not logs_db.exists():
+        return stats
+
+    conn = sqlite3.connect(str(logs_db))
+    try:
+        conn.row_factory = sqlite3.Row
+        stats["compact_event_count"] = int(
+            (
+                conn.execute(
+                    "select count(*) as n from logs where thread_id = ? and feedback_log_body like ?",
+                    (thread_id, '%api.path="responses/compact"%'),
+                ).fetchone()
+                or {"n": 0}
+            )["n"]
+        )
+        stats["compact_http_500_count"] = int(
+            (
+                conn.execute(
+                    "select count(*) as n from logs where thread_id = ? and feedback_log_body like ?",
+                    (thread_id, "%http.response.status_code=500%"),
+                ).fetchone()
+                or {"n": 0}
+            )["n"]
+        )
+        stats["compact_send_error_count"] = int(
+            (
+                conn.execute(
+                    "select count(*) as n from logs where thread_id = ? and feedback_log_body like ?",
+                    (
+                        thread_id,
+                        "%error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)%",
+                    ),
+                ).fetchone()
+                or {"n": 0}
+            )["n"]
+        )
+    except Exception:
+        return stats
+    finally:
+        conn.close()
+
+    return stats
+
+
+def format_log_timestamp(ts: int | None) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def summarize_compact_error_message(message: str) -> str:
+    message = (message or "").strip()
+    if not message:
+        return "-"
+    if "does not exist or you do not have access to it" in message:
+        match = re.search(r"The model `([^`]+)` does not exist or you do not have access to it", message)
+        if match:
+            return bi(
+                f"远端 compact 失败：模型 {match.group(1)} 不可用或当前账号无权限。",
+                f"Remote compact failed: model {match.group(1)} is unavailable or not accessible for this account.",
+            )
+        return bi(
+            "远端 compact 失败：模型不可用或当前账号无权限。",
+            "Remote compact failed: the model is unavailable or not accessible for this account.",
+        )
+    if "unexpected status 404 Not Found" in message:
+        return bi(
+            "远端 compact 返回 404。",
+            "Remote compact returned 404.",
+        )
+    if "unexpected status 403 Forbidden" in message:
+        return bi(
+            "远端 compact 返回 403。",
+            "Remote compact returned 403.",
+        )
+    if "unexpected status 500" in message or "http 500" in message:
+        return bi(
+            "远端 compact 返回 500。",
+            "Remote compact returned 500.",
+        )
+    return message.split(", url:", 1)[0].strip()
+
+
+def load_rollout_compact_state(rollout_path: Path) -> dict | None:
+    if not rollout_path.exists():
+        return None
+
+    tail: deque[str] = deque(maxlen=400)
+    try:
+        with rollout_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                text = line.rstrip("\n")
+                if text:
+                    tail.append(text)
+    except Exception:
+        return None
+
+    for text in reversed(tail):
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        if obj.get("type") != "event_msg":
+            continue
+
+        payload = obj.get("payload") or {}
+        if payload.get("type") != "error":
+            continue
+
+        message = (payload.get("message") or "").strip()
+        if "compact" not in message.lower():
+            continue
+
+        return {
+            "label": bi("最近一次 compact 远端失败", "Latest compact failed remotely"),
+            "time_text": format_local_timestamp(int(datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00")).timestamp() * 1000))
+            if obj.get("timestamp")
+            else "-",
+            "detail": summarize_compact_error_message(message),
+        }
+
+    return None
+
+
+def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Path) -> dict:
+    rollout_state = load_rollout_compact_state(rollout_path)
+    if rollout_state:
+        return rollout_state
+
+    logs_db = codex_home / "logs_2.sqlite"
+    default_state = {
+        "label": bi("未发现最近 compact 结果", "No recent compact result"),
+        "time_text": "-",
+        "detail": bi("最近没有看到明确的 compact 成功或失败记录。", "No recent compact success or failure record was found."),
+    }
+    if not logs_db.exists():
+        return default_state
+
+    conn = sqlite3.connect(str(logs_db))
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select ts, feedback_log_body
+            from logs
+            where thread_id = ?
+              and (
+                feedback_log_body like ?
+                or feedback_log_body like ?
+                or feedback_log_body like ?
+              )
+            order by ts desc, id desc
+            limit 20
+            """,
+            (
+                thread_id,
+                '%api.path="responses/compact"%',
+                "%http.response.status_code=%",
+                f"%{COMPACT_SEND_ERROR_TEXT}%",
+            ),
+        ).fetchall()
+    except Exception:
+        conn.close()
+        return default_state
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    for row in rows:
+        body = row["feedback_log_body"] or ""
+        time_text = format_log_timestamp(int(row["ts"]))
+        if COMPACT_SEND_ERROR_TEXT in body:
+            return {
+                "label": bi("最近一次 compact 发送失败", "Latest compact send failed"),
+                "time_text": time_text,
+                "detail": bi(
+                    "请求已经发起，但到 chatgpt.com 的 compact 请求没有成功发出去。",
+                    "The compact request was started but was not sent successfully to chatgpt.com.",
+                ),
+            }
+
+        match = COMPACT_HTTP_STATUS_RE.search(body)
+        if match:
+            status_code = int(match.group(1))
+            if status_code == 200:
+                return {
+                    "label": bi("最近一次 compact 成功", "Latest compact succeeded"),
+                    "time_text": time_text,
+                    "detail": bi("最近一次 compact 请求返回了 200。", "The latest compact request returned 200."),
+                }
+            return {
+                "label": bi(f"最近一次 compact 返回 {status_code}", f"Latest compact returned {status_code}"),
+                "time_text": time_text,
+                "detail": bi(
+                    f"最近一次 compact 请求返回了 HTTP {status_code}。",
+                    f"The latest compact request returned HTTP {status_code}.",
+                ),
+            }
+
+    if rows:
+        return {
+            "label": bi("最近触发过 compact", "Recent compact activity"),
+            "time_text": format_log_timestamp(int(rows[0]["ts"])),
+            "detail": bi(
+                "看到了 compact 链路活动，但最近几条日志里没有明确成功或失败结果。",
+                "Compact activity was seen, but the latest log entries did not contain a clear success or failure outcome.",
+            ),
+        }
+
+    return default_state
+
+
+def assess_thread_risk(
+    *,
+    model: str,
+    reasoning_effort: str,
+    inspect_status: str,
+    status_rank: str,
+    compact_event_count: int,
+    compact_http_500_count: int,
+    compact_send_error_count: int,
+) -> tuple[str, str, str]:
+    reasons: list[str] = []
+    score = 0
+
+    if model == "gpt-5.5" and reasoning_effort.lower() == "xhigh":
+        score += 2
+        reasons.append(bi("`gpt-5.5 xhigh` 更容易把长线程推回 compact。", "`gpt-5.5 xhigh` is more likely to push long threads back into compaction."))
+
+    if compact_event_count >= 20:
+        score += 2
+        reasons.append(bi(f"这条线程已经出现很多次 compact 相关事件（{compact_event_count} 次）。", f"This thread has already produced many compact-related events ({compact_event_count})."))
+
+    if compact_http_500_count > 0:
+        score += 3
+        reasons.append(bi(f"这条线程已经出现 compact `HTTP 500`（{compact_http_500_count} 次）。", f"This thread has already hit compact `HTTP 500` ({compact_http_500_count} times)."))
+
+    if compact_send_error_count > 0:
+        score += 3
+        reasons.append(bi(f"这条线程已经出现 compact 发送失败（{compact_send_error_count} 次）。", f"This thread has already hit compact send errors ({compact_send_error_count} times)."))
+
+    if inspect_status == "orphan_task_started" or status_rank == "stuck":
+        score += 2
+        reasons.append(bi("它当前已经进入悬空 turn / 卡住状态。", "It is currently in an open-turn / stuck state."))
+
+    if score >= 6:
+        return (
+            bi("高复发风险", "High recurrence risk"),
+            "high",
+            " ".join(reasons),
+        )
+    if score >= 3:
+        return (
+            bi("中等复发风险", "Medium recurrence risk"),
+            "medium",
+            " ".join(reasons),
+        )
+    return (
+        bi("较低复发风险", "Lower recurrence risk"),
+        "low",
+        bi("目前没有看到特别明显的高危信号。", "No strong high-risk signals are visible right now."),
+    )
 
 
 def load_thread_rows(
@@ -194,6 +484,8 @@ def load_thread_rows(
         open_turns: list[dict] = []
         open_age_seconds = None
         rollout_idle_seconds = None
+        compact_stats = load_thread_compact_stats(codex_home, thread["id"])
+        compact_state = load_thread_compact_state(codex_home, thread["id"], rollout_path)
 
         if rollout_path.exists():
             try:
@@ -228,6 +520,16 @@ def load_thread_rows(
                 status_rank = "error"
                 status_label = STATUS_TEXT["error"]
 
+        risk_label, risk_rank, risk_reason = assess_thread_risk(
+            model=thread.get("model") or "",
+            reasoning_effort=thread.get("reasoning_effort") or "",
+            inspect_status=inspect_status,
+            status_rank=status_rank,
+            compact_event_count=compact_stats["compact_event_count"],
+            compact_http_500_count=compact_stats["compact_http_500_count"],
+            compact_send_error_count=compact_stats["compact_send_error_count"],
+        )
+
         summary = ThreadSummary(
             thread_id=thread["id"],
             title=title,
@@ -248,6 +550,15 @@ def load_thread_rows(
             rollout_idle_seconds=rollout_idle_seconds,
             open_turn=open_turn,
             open_turns=open_turns,
+            compact_event_count=compact_stats["compact_event_count"],
+            compact_http_500_count=compact_stats["compact_http_500_count"],
+            compact_send_error_count=compact_stats["compact_send_error_count"],
+            compact_state_label=compact_state["label"],
+            compact_state_time_text=compact_state["time_text"],
+            compact_state_detail=compact_state["detail"],
+            risk_label=risk_label,
+            risk_rank=risk_rank,
+            risk_reason=risk_reason,
             raw_thread=thread,
         )
         if only_stuck and summary.status_rank != "stuck":
@@ -298,6 +609,54 @@ def run_fallback_repair(
     return result
 
 
+def should_try_compact_only_fallback(thread: ThreadSummary) -> bool:
+    detail = (thread.compact_state_detail or "").lower()
+    label = (thread.compact_state_label or "").lower()
+    model = (thread.model or "").lower()
+    if model != "gpt-5.5":
+        return False
+    compact_model_failure_markers = [
+        "remote compact failed",
+        "remote compact returned 404",
+        "not accessible for this account",
+        "model gpt-5.5 is unavailable",
+        "远端 compact 失败",
+        "远端 compact 返回 404",
+        "不可用",
+        "无权限",
+    ]
+    haystack = f"{label}\n{detail}"
+    return any(marker in haystack for marker in compact_model_failure_markers)
+
+
+def run_compact_only_fallback(
+    *,
+    codex_home: Path,
+    thread: ThreadSummary,
+    output_dir: Path,
+) -> dict:
+    rollout_path = Path(thread.rollout_path)
+    external_result = run_external_compact_fallback(
+        codex_home=codex_home,
+        thread_id=thread.thread_id,
+        fallback_model="gpt-5.4",
+        timeout_seconds=120,
+        output_dir=output_dir,
+    )
+    after = inspect_thread(thread.raw_thread, rollout_path)
+    result = {
+        "mode": "compact_only_fallback",
+        "thread_id": thread.thread_id,
+        "title": thread.title,
+        "external_result": external_result,
+        "after_status": after["status"],
+        "after_open_turns": after.get("open_turns") or [],
+        "ok": external_result.get("status") == "compact_succeeded" and after["status"] != "orphan_task_started",
+    }
+    append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
+    return result
+
+
 def run_one_click_repair(
     *,
     codex_home: Path,
@@ -322,6 +681,18 @@ def run_one_click_repair(
     if before["status"] != "orphan_task_started":
         result["status"] = "healthy"
         return result
+
+    if should_try_compact_only_fallback(thread):
+        compact_only_result = run_compact_only_fallback(
+            codex_home=codex_home,
+            thread=thread,
+            output_dir=output_dir,
+        )
+        result["compact_only_fallback"] = compact_only_result
+        if compact_only_result.get("ok"):
+            result["status"] = "repaired_compact_only_fallback"
+            append_jsonl(output_dir / "gui_actions.jsonl", result)
+            return result
 
     if is_codex_running():
         live_result = run_live_interrupt_until_stable(
@@ -699,6 +1070,8 @@ class RescueApp:
             f"{bi('标题', 'Title')}: {row.title}",
             f"{bi('状态', 'Status')}: {row.status_label}",
             f"{bi('检查状态', 'Inspect Status')}: {row.inspect_status}",
+            f"{bi('Compact 状态', 'Compact State')}: {row.compact_state_label}",
+            f"{bi('Compact 时间', 'Compact Time')}: {row.compact_state_time_text}",
             f"{bi('工作区', 'Workspace')}: {row.cwd or '-'}",
             f"{bi('更新时间', 'Updated')}: {row.updated_text}",
             f"{bi('模型', 'Model')}: {(row.model + ' ' + row.reasoning_effort).strip()}",
@@ -707,6 +1080,8 @@ class RescueApp:
             f"{bi('文件静止时长', 'Rollout Idle')}: {format_age(row.rollout_idle_seconds)}",
             f"{bi('悬空回合数量', 'Open Turn Count')}: {len(row.open_turns)}",
         ]
+        if row.compact_state_detail:
+            detail_lines.append(f"{bi('Compact 说明', 'Compact Detail')}: {row.compact_state_detail}")
         if row.open_turn:
             detail_lines.extend(
                 [
@@ -719,8 +1094,24 @@ class RescueApp:
             [
                 "",
                 bi("修复策略", "Repair Strategy") + ":",
-                f"1. {bi('先通过本地 Codex IPC 发送真实 interrupt', 'Try live interrupt through the local Codex IPC pipe')}.",
-                f"2. {bi('如果仍然卡住，并且你允许保守修复，就在本地追加 turn_aborted 并自动备份', 'If still stuck and fallback is allowed, append turn_aborted locally with backups')}.",
+                "1. "
+                + bi(
+                    "如果最近的 compact 是远端 404 / 模型无权限，一键修复会先尝试 compact-only fallback：仅把压缩会话临时降到 gpt-5.4，不改线程保存下来的正常聊天模型",
+                    "If the latest compact failed remotely with 404 or model access issues, one-click repair first tries a compact-only fallback: it temporarily resumes compaction as gpt-5.4 without changing the thread's stored normal chat model",
+                )
+                + ".",
+                "2. "
+                + bi(
+                    "如果 compact-only fallback 不适用或没有修好，再通过本地 Codex IPC 发送真实 interrupt",
+                    "If compact-only fallback does not apply or does not clear the thread, try a live interrupt through the local Codex IPC pipe",
+                )
+                + ".",
+                "3. "
+                + bi(
+                    "如果仍然卡住，并且你允许保守修复，就在本地追加 turn_aborted 并自动备份",
+                    "If still stuck and fallback is allowed, append turn_aborted locally with backups",
+                )
+                + ".",
             ]
         )
 

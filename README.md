@@ -78,6 +78,7 @@ This package provides a local GUI that:
 
 - inspects recent Codex Desktop threads
 - flags threads that look likely stuck
+- if a thread is using `gpt-5.5` and recent compact logs show remote `404` or model access failure, it first tries a compact-only fallback by running compaction through a separate local app-server with `gpt-5.4`
 - tries a live repair first by sending a real interrupt through the local Codex IPC path
 - optionally falls back to a conservative local repair if you explicitly allow it
 
@@ -89,6 +90,7 @@ The tool tries to avoid restart-first recovery and focuses on rescuing the origi
 
 - 检查最近的 Codex Desktop 线程
 - 标记疑似卡死线程
+- 如果线程使用的是 `gpt-5.5`，并且最近的 compact 日志显示远端 `404` 或模型无权限，它会先尝试一种“只修 compact”的回退办法：通过独立的本地 app-server 用 `gpt-5.4` 临时执行压缩
 - 优先尝试实时修复，也就是通过本地 Codex IPC 发送真实 interrupt
 - 只有你明确允许时，才使用更保守的本地兜底修复
 
@@ -117,6 +119,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 - If the tool reports success but the chat UI still says automatic context compaction, send a very short follow-up such as "continue" in that same chat and wait a moment before trying anything more drastic.
 - If the terminal already succeeded but the desktop UI still shows the old state, try sending a very simple message such as "hi" or "continue" in that chat.
 - If that still does not refresh the UI, switch to another conversation and then switch back.
+- If a `gpt-5.5` thread is failing only during compaction, the compact-only fallback may take a little longer than a normal interrupt repair. Give it a short moment before assuming it failed.
 - Avoid mixing restart, model switching, branching, and terminal compaction randomly, because it makes the failure harder to understand.
 
 ## 使用小贴士
@@ -125,6 +128,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 - 先刷新线程列表，判断它是不是真的卡住了。
 - 如果终端已经成功，但桌面版 UI 还没刷新，可以先在那个聊天里发一句很简单的话，比如“嗨”或者“继续”。
 - 如果这样还是没刷新，可以切到别的对话，再切回来。
+- 如果是 `gpt-5.5` 线程只在压缩阶段失败，compact-only fallback 可能会比普通 interrupt 修复稍慢一点，先给它一点时间，不要立刻判断失败。
 - 不建议把重启、切模型、派生、终端 compact 混在一起乱试，否则更难判断是哪一步真正起作用。
 
 ## Scope And Limitations
@@ -146,6 +150,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 - `tool/run_rescue_gui.ps1`
 - `tool/rescue_gui.py`
 - `tool/auto_repair.py`
+- `tool/external_compact_fallback.py`
 - `tool/unstick_thread.py`
 - `tool/codex_ipc_control.js`
 
