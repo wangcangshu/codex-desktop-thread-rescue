@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 import traceback
@@ -59,6 +60,7 @@ DEFAULT_STUCK_SECONDS = 180
 DEFAULT_SETTLE_SECONDS = 6
 DEFAULT_TIMEOUT_MS = 12000
 DEFAULT_COMPACT_SETTLE_SECONDS = 45
+FRONTEND_SYNC_WINDOW_SECONDS = 900
 
 FRONTEND_REFRESH_TIP = bi(
     "重要提示：只有在工具已经修复成功，并且再次刷新检查后确认这个线程已经没有 open turn 的情况下，才适合回到原聊天里发一句很短的话，比如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
@@ -67,6 +69,7 @@ FRONTEND_REFRESH_TIP = bi(
 
 STATUS_TEXT = {
     "healthy": bi("正常", "Healthy"),
+    "sync": bi("后台已好", "Backend Healed"),
     "stuck": bi("可能卡死", "Likely Stuck"),
     "active": bi("有未完成回合", "Open Turn"),
     "error": bi("检查失败", "Inspect Error"),
@@ -150,9 +153,13 @@ class ThreadSummary:
     compact_event_count: int
     compact_http_500_count: int
     compact_send_error_count: int
+    compact_state_kind: str
+    compact_state_timestamp_ms: int | None
     compact_state_label: str
     compact_state_time_text: str
     compact_state_detail: str
+    frontend_sync_label: str
+    frontend_sync_detail: str
     risk_label: str
     risk_rank: str
     risk_reason: str
@@ -216,6 +223,15 @@ def format_log_timestamp(ts: int | None) -> str:
     return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def iso_to_timestamp_ms(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+
 def summarize_compact_error_message(message: str) -> str:
     message = (message or "").strip()
     if not message:
@@ -269,6 +285,19 @@ def load_rollout_compact_state(rollout_path: Path) -> dict | None:
         except json.JSONDecodeError:
             continue
 
+        if obj.get("type") == "compacted":
+            timestamp_ms = iso_to_timestamp_ms(obj.get("timestamp"))
+            return {
+                "kind": "success",
+                "timestamp_ms": timestamp_ms,
+                "label": bi("最近一次 compact 成功", "Latest compact succeeded"),
+                "time_text": format_local_timestamp(timestamp_ms),
+                "detail": bi(
+                    "后台已经完成了一次上下文压缩。",
+                    "The backend has already completed a context compaction.",
+                ),
+            }
+
         if obj.get("type") != "event_msg":
             continue
 
@@ -281,10 +310,10 @@ def load_rollout_compact_state(rollout_path: Path) -> dict | None:
             continue
 
         return {
+            "kind": "failure",
+            "timestamp_ms": iso_to_timestamp_ms(obj.get("timestamp")),
             "label": bi("最近一次 compact 远端失败", "Latest compact failed remotely"),
-            "time_text": format_local_timestamp(int(datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00")).timestamp() * 1000))
-            if obj.get("timestamp")
-            else "-",
+            "time_text": format_local_timestamp(iso_to_timestamp_ms(obj.get("timestamp"))),
             "detail": summarize_compact_error_message(message),
         }
 
@@ -298,6 +327,8 @@ def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Pa
 
     logs_db = codex_home / "logs_2.sqlite"
     default_state = {
+        "kind": "unknown",
+        "timestamp_ms": None,
         "label": bi("未发现最近 compact 结果", "No recent compact result"),
         "time_text": "-",
         "detail": bi("最近没有看到明确的 compact 成功或失败记录。", "No recent compact success or failure record was found."),
@@ -339,9 +370,13 @@ def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Pa
 
     for row in rows:
         body = row["feedback_log_body"] or ""
-        time_text = format_log_timestamp(int(row["ts"]))
+        ts = int(row["ts"])
+        time_text = format_log_timestamp(ts)
+        timestamp_ms = ts * 1000
         if COMPACT_SEND_ERROR_TEXT in body:
             return {
+                "kind": "failure",
+                "timestamp_ms": timestamp_ms,
                 "label": bi("最近一次 compact 发送失败", "Latest compact send failed"),
                 "time_text": time_text,
                 "detail": bi(
@@ -355,11 +390,15 @@ def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Pa
             status_code = int(match.group(1))
             if status_code == 200:
                 return {
+                    "kind": "success",
+                    "timestamp_ms": timestamp_ms,
                     "label": bi("最近一次 compact 成功", "Latest compact succeeded"),
                     "time_text": time_text,
                     "detail": bi("最近一次 compact 请求返回了 200。", "The latest compact request returned 200."),
                 }
             return {
+                "kind": "failure",
+                "timestamp_ms": timestamp_ms,
                 "label": bi(f"最近一次 compact 返回 {status_code}", f"Latest compact returned {status_code}"),
                 "time_text": time_text,
                 "detail": bi(
@@ -370,6 +409,8 @@ def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Pa
 
     if rows:
         return {
+            "kind": "activity",
+            "timestamp_ms": int(rows[0]["ts"]) * 1000,
             "label": bi("最近触发过 compact", "Recent compact activity"),
             "time_text": format_log_timestamp(int(rows[0]["ts"])),
             "detail": bi(
@@ -379,6 +420,86 @@ def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Pa
         }
 
     return default_state
+
+
+def determine_frontend_sync_hint(
+    *,
+    inspect_status: str,
+    compact_state_kind: str,
+    compact_state_timestamp_ms: int | None,
+    now_ms: int,
+) -> tuple[str, str]:
+    if inspect_status != "no_open_turn":
+        return "", ""
+    if compact_state_kind != "success":
+        return "", ""
+    if compact_state_timestamp_ms and (now_ms - compact_state_timestamp_ms) > FRONTEND_SYNC_WINDOW_SECONDS * 1000:
+        return "", ""
+    return (
+        bi("后台已经压好，前端可能没刷新", "Backend compacted; UI may be stale"),
+        bi(
+            "先点“软刷新前端”。如果聊天页还是旧画面，再点“只重载界面层”。这两步只应该在没有 open turn 的前提下做。",
+            "Try Soft Reload UI first. If the chat page is still stale, use Restart Renderer Only. Only do this when the thread has no open turn.",
+        ),
+    )
+
+
+def run_powershell(script: str, timeout_seconds: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+
+
+def soft_reload_codex_ui() -> dict:
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$ws = New-Object -ComObject WScript.Shell
+if (-not $ws.AppActivate('Codex')) {
+  throw 'Could not focus a Codex window.'
+}
+Start-Sleep -Milliseconds 200
+[System.Windows.Forms.SendKeys]::SendWait('^r')
+'soft_reload_sent'
+"""
+    result = run_powershell(script, timeout_seconds=20)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Soft reload failed.").strip())
+    return {
+        "mode": "soft_reload_ui",
+        "stdout": (result.stdout or "").strip(),
+        "stderr": (result.stderr or "").strip(),
+    }
+
+
+def restart_codex_renderer_only() -> dict:
+    script = r"""
+$before = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Codex.exe' -and $_.CommandLine -match '--type=renderer' } | ForEach-Object { $_.ProcessId })
+if (-not $before -or $before.Count -eq 0) {
+  throw 'No Codex renderer process found.'
+}
+$before | ForEach-Object { Stop-Process -Id $_ -Force }
+Start-Sleep -Seconds 2
+$after = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Codex.exe' -and $_.CommandLine -match '--type=renderer' } | ForEach-Object { $_.ProcessId })
+@{ before = $before; after = $after } | ConvertTo-Json -Compress
+"""
+    result = run_powershell(script, timeout_seconds=20)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Renderer restart failed.").strip())
+    payload = {}
+    stdout = (result.stdout or "").strip()
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = {"raw": stdout}
+    return {
+        "mode": "restart_renderer_only",
+        "payload": payload,
+        "stderr": (result.stderr or "").strip(),
+    }
 
 
 def assess_thread_risk(
@@ -465,6 +586,7 @@ def load_thread_rows(
     lowered_title = title_filter.strip().lower()
     summaries: list[ThreadSummary] = []
     current_time = now_seconds()
+    current_time_ms = current_time * 1000
 
     for row in rows:
         thread = dict(row)
@@ -530,6 +652,15 @@ def load_thread_rows(
             compact_http_500_count=compact_stats["compact_http_500_count"],
             compact_send_error_count=compact_stats["compact_send_error_count"],
         )
+        frontend_sync_label, frontend_sync_detail = determine_frontend_sync_hint(
+            inspect_status=inspect_status,
+            compact_state_kind=compact_state["kind"],
+            compact_state_timestamp_ms=compact_state["timestamp_ms"],
+            now_ms=current_time_ms,
+        )
+        if frontend_sync_label:
+            status_rank = "sync"
+            status_label = STATUS_TEXT["sync"]
 
         summary = ThreadSummary(
             thread_id=thread["id"],
@@ -554,9 +685,13 @@ def load_thread_rows(
             compact_event_count=compact_stats["compact_event_count"],
             compact_http_500_count=compact_stats["compact_http_500_count"],
             compact_send_error_count=compact_stats["compact_send_error_count"],
+            compact_state_kind=compact_state["kind"],
+            compact_state_timestamp_ms=compact_state["timestamp_ms"],
             compact_state_label=compact_state["label"],
             compact_state_time_text=compact_state["time_text"],
             compact_state_detail=compact_state["detail"],
+            frontend_sync_label=frontend_sync_label,
+            frontend_sync_detail=frontend_sync_detail,
             risk_label=risk_label,
             risk_rank=risk_rank,
             risk_reason=risk_reason,
@@ -914,7 +1049,7 @@ class RescueApp:
 
         controls = ttk.Frame(self.root, padding=12)
         controls.grid(row=0, column=0, sticky="ew")
-        for column in range(9):
+        for column in range(10):
             controls.columnconfigure(column, weight=0)
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(3, weight=1)
@@ -968,6 +1103,12 @@ class RescueApp:
         )
         ttk.Button(controls, text=bi("复制线程 ID", "Copy Thread ID"), command=self.copy_thread_id).grid(row=2, column=6, sticky="ew", pady=(10, 0))
         ttk.Button(controls, text=bi("打开 Rollout 文件", "Open Rollout"), command=self.open_rollout).grid(row=2, column=7, sticky="ew", padx=(8, 0), pady=(10, 0))
+        ttk.Button(controls, text=bi("软刷新前端", "Soft Reload UI"), command=self.soft_reload_ui).grid(
+            row=2, column=8, sticky="ew", padx=(8, 0), pady=(10, 0)
+        )
+        ttk.Button(controls, text=bi("只重载界面层", "Restart Renderer Only"), command=self.restart_renderer_only).grid(
+            row=2, column=9, sticky="ew", padx=(8, 0), pady=(10, 0)
+        )
 
         tip_frame = ttk.LabelFrame(self.root, text=bi("重要提示", "Important Tip"), padding=(12, 8))
         tip_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
@@ -1013,6 +1154,7 @@ class RescueApp:
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.tag_configure("healthy", foreground="#1f7a1f")
+        self.tree.tag_configure("sync", foreground="#005fb8")
         self.tree.tag_configure("stuck", foreground="#b3261e")
         self.tree.tag_configure("active", foreground="#9a6700")
         self.tree.tag_configure("error", foreground="#7a7a7a")
@@ -1153,6 +1295,9 @@ class RescueApp:
         ]
         if row.compact_state_detail:
             detail_lines.append(f"{bi('Compact 说明', 'Compact Detail')}: {row.compact_state_detail}")
+        if row.frontend_sync_label:
+            detail_lines.append(f"{bi('前端同步提示', 'Frontend Sync Hint')}: {row.frontend_sync_label}")
+            detail_lines.append(f"{bi('推荐动作', 'Recommended Action')}: {row.frontend_sync_detail}")
         if row.open_turn:
             detail_lines.extend(
                 [
@@ -1305,6 +1450,127 @@ class RescueApp:
         self.details.configure(state="disabled")
 
         self.refresh_threads()
+
+    def compact_selected_gpt54(self) -> None:
+        row = self.selected_row()
+        if not row:
+            messagebox.showinfo(APP_TITLE, bi("请先选中一个线程。", "Select a thread first."))
+            return
+
+        codex_home = Path(self.codex_home_var.get()).expanduser()
+        output_dir = self.output_dir
+        rollout_path = Path(row.rollout_path)
+
+        def task():
+            result = run_external_compact_fallback(
+                codex_home=codex_home,
+                thread_id=row.thread_id,
+                fallback_model="gpt-5.4",
+                timeout_seconds=120,
+                output_dir=output_dir,
+            )
+            after = inspect_thread(row.raw_thread, rollout_path)
+            return {
+                "timestamp": utc_timestamp(),
+                "mode": "compact_only_gpt54",
+                "thread_id": row.thread_id,
+                "title": row.title,
+                "result": result,
+                "after_status": after["status"],
+                "after_open_turns": after.get("open_turns") or [],
+            }
+
+        self.run_background(
+            bi("正在执行 gpt-5.4 手动压缩...", "Running manual gpt-5.4 compaction..."),
+            task,
+            self.on_compact_only_complete,
+        )
+
+    def on_compact_only_complete(self, payload: dict) -> None:
+        result = payload.get("result") or {}
+        compact_outcome = result.get("compact_outcome") or {}
+        status = result.get("status", "unknown")
+        outcome = compact_outcome.get("status") or compact_outcome.get("kind") or "-"
+        after_status = payload.get("after_status") or "-"
+        self.status_var.set(
+            f"{bi('5.4 压缩完成', '5.4 compaction finished')}: {status} / {outcome} / {bi('后置状态', 'After')}: {after_status}"
+        )
+
+        self.details.configure(state="normal")
+        self.details.insert(
+            tk.END,
+            "\n\n" + bi("最近一次 5.4 压缩结果", "Last 5.4 Compaction Result") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+        self.details.see(tk.END)
+        self.details.configure(state="disabled")
+
+        compact_ok = bool(status == "compact_succeeded" or compact_outcome.get("ok"))
+        if compact_ok and after_status == "no_open_turn":
+            messagebox.showinfo(
+                APP_TITLE,
+                bi(
+                    "后台已经压好了。如果聊天页还是旧画面，先点“软刷新前端”；如果还不变，再点“只重载界面层”。",
+                    "The backend compaction has finished. If the chat page is still stale, use Soft Reload UI first; if that still does not sync it, use Restart Renderer Only.",
+                ),
+            )
+
+        self.refresh_threads()
+
+    def soft_reload_ui(self) -> None:
+        row = self.selected_row()
+        if row and row.inspect_status == "orphan_task_started":
+            proceed = messagebox.askyesno(
+                APP_TITLE,
+                bi(
+                    "当前选中线程还显示有 open turn。软刷新前端更适合“后台已好但页面没刷新”的情况。\n\n仍然继续吗？",
+                    "The selected thread still has an open turn. Soft Reload UI is mainly for when the backend is already healed but the page stayed stale.\n\nDo you want to continue anyway?",
+                ),
+            )
+            if not proceed:
+                return
+
+        self.run_background(
+            bi("正在软刷新 Codex 前端...", "Sending a soft Codex UI reload..."),
+            soft_reload_codex_ui,
+            self.on_soft_reload_complete,
+        )
+
+    def restart_renderer_only(self) -> None:
+        proceed = messagebox.askyesno(
+            APP_TITLE,
+            bi(
+                "这一步会只重载 Codex 的界面层，不会重启整个 App。\n\n如果终端任务已经跑完，但聊天页还是旧画面，这通常是下一步。\n\n继续吗？",
+                "This reloads only the Codex UI layer, not the whole app.\n\nUse it when terminal work is done but the chat page is still stale.\n\nContinue?",
+            ),
+        )
+        if not proceed:
+            return
+
+        self.run_background(
+            bi("正在重载 Codex 界面层...", "Restarting the Codex renderer only..."),
+            restart_codex_renderer_only,
+            self.on_renderer_restart_complete,
+        )
+
+    def on_soft_reload_complete(self, payload: dict) -> None:
+        self.status_var.set(bi("已发送软刷新前端", "Soft Reload UI sent"))
+        self.details.configure(state="normal")
+        self.details.insert(
+            tk.END,
+            "\n\n" + bi("最近一次前端软刷新", "Last Soft UI Reload") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+        self.details.see(tk.END)
+        self.details.configure(state="disabled")
+
+    def on_renderer_restart_complete(self, payload: dict) -> None:
+        self.status_var.set(bi("已重载界面层", "Renderer reloaded"))
+        self.details.configure(state="normal")
+        self.details.insert(
+            tk.END,
+            "\n\n" + bi("最近一次界面层重载", "Last Renderer Reload") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+        self.details.see(tk.END)
+        self.details.configure(state="disabled")
 
     def copy_thread_id(self) -> None:
         row = self.selected_row()
