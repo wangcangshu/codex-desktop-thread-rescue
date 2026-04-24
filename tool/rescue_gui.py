@@ -914,7 +914,7 @@ class RescueApp:
 
         controls = ttk.Frame(self.root, padding=12)
         controls.grid(row=0, column=0, sticky="ew")
-        for column in range(8):
+        for column in range(9):
             controls.columnconfigure(column, weight=0)
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(3, weight=1)
@@ -943,6 +943,10 @@ class RescueApp:
             text=bi("保守修复时处理全部悬空回合", "Fallback repairs all open turns"),
             variable=self.repair_all_turns_var,
         ).grid(row=1, column=6, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
+
+        ttk.Button(controls, text=bi("5.4 压缩", "Compact 5.4"), command=self.compact_selected_gpt54).grid(
+            row=1, column=8, sticky="ew", padx=(8, 0), pady=(10, 0)
+        )
 
         ttk.Label(controls, text="Node").grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(controls, textvariable=self.node_command_var, width=12).grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(10, 0))
@@ -1238,6 +1242,36 @@ class RescueApp:
 
         self.run_background(bi("正在修复选中线程...", "Repairing selected thread..."), task, self.on_repair_complete)
 
+    def compact_selected_gpt54(self) -> None:
+        row = self.selected_row()
+        if not row:
+            messagebox.showinfo(APP_TITLE, bi("璇峰厛閫変腑涓€涓嚎绋嬨€?", "Select a thread first."))
+            return
+
+        codex_home = Path(self.codex_home_var.get()).expanduser()
+        output_dir = self.output_dir
+
+        def task():
+            return {
+                "timestamp": utc_timestamp(),
+                "mode": "compact_only_gpt54",
+                "thread_id": row.thread_id,
+                "title": row.title,
+                "result": run_external_compact_fallback(
+                    codex_home=codex_home,
+                    thread_id=row.thread_id,
+                    fallback_model="gpt-5.4",
+                    timeout_seconds=120,
+                    output_dir=output_dir,
+                ),
+            }
+
+        self.run_background(
+            bi("姝ｅ湪鐢?gpt-5.4 鎵嬪姩鍘嬬缉...", "Running manual gpt-5.4 compaction..."),
+            task,
+            self.on_compact_only_complete,
+        )
+
     def on_repair_complete(self, payload: dict) -> None:
         status = payload.get("status", "unknown")
         self.status_var.set(f"{bi('修复完成', 'Repair finished')}: {status}")
@@ -1252,6 +1286,23 @@ class RescueApp:
 
         if status.startswith("repaired_"):
             messagebox.showinfo(APP_TITLE, FRONTEND_REFRESH_TIP)
+
+        self.refresh_threads()
+
+    def on_compact_only_complete(self, payload: dict) -> None:
+        result = payload.get("result") or {}
+        compact_outcome = result.get("compact_outcome") or {}
+        status = result.get("status", "unknown")
+        outcome = compact_outcome.get("status") or compact_outcome.get("kind") or "-"
+        self.status_var.set(f"{bi('5.4 鍘嬬缉瀹屾垚', '5.4 compaction finished')}: {status} / {outcome}")
+
+        self.details.configure(state="normal")
+        self.details.insert(
+            tk.END,
+            "\n\n" + bi("鏈€杩戜竴娆?5.4 鍘嬬缉缁撴灉", "Last 5.4 Compaction Result") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+        self.details.see(tk.END)
+        self.details.configure(state="disabled")
 
         self.refresh_threads()
 
