@@ -78,8 +78,9 @@ This package provides a local GUI that:
 
 - inspects recent Codex Desktop threads
 - flags threads that look likely stuck
-- if a thread is using `gpt-5.5` and recent compact logs show remote `404` or model access failure, it first tries a compact-only fallback by running compaction through a separate local app-server with `gpt-5.4`
-- tries a live repair first by sending a real interrupt through the local Codex IPC path
+- if a thread has been stuck in compaction long enough to look frozen, it first tries to manually push compaction through a separate local app-server
+- `gpt-5.5` threads go straight to `gpt-5.4` for the compact step; other models try the original model first and then retry once with `gpt-5.4` if needed
+- only if manual compaction still does not clear the thread does it try a live repair by sending a real interrupt through the local Codex IPC path
 - optionally falls back to a conservative local repair if you explicitly allow it
 
 The tool tries to avoid restart-first recovery and focuses on rescuing the original thread whenever possible.
@@ -119,7 +120,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 - If the tool reports success but the chat UI still says automatic context compaction, send a very short follow-up such as "continue" in that same chat and wait a moment before trying anything more drastic.
 - If the terminal already succeeded but the desktop UI still shows the old state, try sending a very simple message such as "hi" or "continue" in that chat.
 - If that still does not refresh the UI, switch to another conversation and then switch back.
-- If a `gpt-5.5` thread is failing only during compaction, the compact-only fallback may take a little longer than a normal interrupt repair. Give it a short moment before assuming it failed.
+- If a stuck thread has been compacting for around 3 minutes with no progress, treat it as likely stuck and let the tool try manual compaction before reaching for interrupt.
+- Manual compaction can take a little longer than a plain interrupt repair. Give it a short moment before assuming it failed.
 - Avoid mixing restart, model switching, branching, and terminal compaction randomly, because it makes the failure harder to understand.
 
 ## 使用小贴士

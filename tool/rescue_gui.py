@@ -629,29 +629,100 @@ def should_try_compact_only_fallback(thread: ThreadSummary) -> bool:
     return any(marker in haystack for marker in compact_model_failure_markers)
 
 
-def run_compact_only_fallback(
+def compact_attempt_models(thread: ThreadSummary) -> list[str]:
+    original_model = (thread.model or "").strip() or "gpt-5.4"
+    candidates: list[str] = []
+
+    # gpt-5.5 chat can work while remote compact intermittently fails. Prefer
+    # compacting through a known-good fallback model without rewriting the
+    # thread's stored normal chat model.
+    if original_model == "gpt-5.5":
+        candidates.append("gpt-5.4")
+    elif should_try_compact_only_fallback(thread):
+        candidates.append("gpt-5.4")
+    else:
+        candidates.append(original_model)
+        if original_model != "gpt-5.4":
+            candidates.append("gpt-5.4")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped or ["gpt-5.4"]
+
+
+def refreshed_thread_summary(thread: ThreadSummary, info: dict) -> ThreadSummary:
+    return ThreadSummary(
+        thread_id=thread.thread_id,
+        title=thread.title,
+        cwd=thread.cwd,
+        cwd_display=thread.cwd_display,
+        updated_at_ms=thread.updated_at_ms,
+        updated_text=thread.updated_text,
+        model=thread.model,
+        reasoning_effort=thread.reasoning_effort,
+        rollout_path=thread.rollout_path,
+        inspect_status=info["status"],
+        status_label=thread.status_label,
+        status_rank=thread.status_rank,
+        open_age_seconds=thread.open_age_seconds,
+        open_age_text=thread.open_age_text,
+        rollout_idle_seconds=thread.rollout_idle_seconds,
+        open_turn=info.get("open_turn"),
+        open_turns=info.get("open_turns") or [],
+        compact_event_count=thread.compact_event_count,
+        compact_http_500_count=thread.compact_http_500_count,
+        compact_send_error_count=thread.compact_send_error_count,
+        compact_state_label=thread.compact_state_label,
+        compact_state_time_text=thread.compact_state_time_text,
+        compact_state_detail=thread.compact_state_detail,
+        risk_label=thread.risk_label,
+        risk_rank=thread.risk_rank,
+        risk_reason=thread.risk_reason,
+        raw_thread=thread.raw_thread,
+    )
+
+
+def run_compact_assist(
     *,
     codex_home: Path,
     thread: ThreadSummary,
     output_dir: Path,
 ) -> dict:
     rollout_path = Path(thread.rollout_path)
-    external_result = run_external_compact_fallback(
-        codex_home=codex_home,
-        thread_id=thread.thread_id,
-        fallback_model="gpt-5.4",
-        timeout_seconds=120,
-        output_dir=output_dir,
-    )
+    attempts: list[dict] = []
     after = inspect_thread(thread.raw_thread, rollout_path)
+    for attempt_model in compact_attempt_models(thread):
+        external_result = run_external_compact_fallback(
+            codex_home=codex_home,
+            thread_id=thread.thread_id,
+            fallback_model=attempt_model,
+            timeout_seconds=120,
+            output_dir=output_dir,
+        )
+        after = inspect_thread(thread.raw_thread, rollout_path)
+        attempt = {
+            "compact_model": attempt_model,
+            "external_result": external_result,
+            "after_status": after["status"],
+            "after_open_turns": after.get("open_turns") or [],
+            "ok": after["status"] != "orphan_task_started",
+        }
+        attempts.append(attempt)
+        if attempt["ok"]:
+            break
+
     result = {
-        "mode": "compact_only_fallback",
+        "mode": "compact_assist",
         "thread_id": thread.thread_id,
         "title": thread.title,
-        "external_result": external_result,
         "after_status": after["status"],
         "after_open_turns": after.get("open_turns") or [],
-        "ok": external_result.get("status") == "compact_succeeded" and after["status"] != "orphan_task_started",
+        "attempts": attempts,
+        "ok": after["status"] != "orphan_task_started",
     }
     append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
     return result
@@ -682,17 +753,16 @@ def run_one_click_repair(
         result["status"] = "healthy"
         return result
 
-    if should_try_compact_only_fallback(thread):
-        compact_only_result = run_compact_only_fallback(
-            codex_home=codex_home,
-            thread=thread,
-            output_dir=output_dir,
-        )
-        result["compact_only_fallback"] = compact_only_result
-        if compact_only_result.get("ok"):
-            result["status"] = "repaired_compact_only_fallback"
-            append_jsonl(output_dir / "gui_actions.jsonl", result)
-            return result
+    compact_assist_result = run_compact_assist(
+        codex_home=codex_home,
+        thread=thread,
+        output_dir=output_dir,
+    )
+    result["compact_assist"] = compact_assist_result
+    if compact_assist_result.get("ok"):
+        result["status"] = "repaired_compact_assist"
+        append_jsonl(output_dir / "gui_actions.jsonl", result)
+        return result
 
     if is_codex_running():
         live_result = run_live_interrupt_until_stable(
@@ -719,26 +789,7 @@ def run_one_click_repair(
                 append_jsonl(output_dir / "gui_actions.jsonl", result)
                 return result
 
-            refreshed = ThreadSummary(
-                thread_id=thread.thread_id,
-                title=thread.title,
-                cwd=thread.cwd,
-                cwd_display=thread.cwd_display,
-                updated_at_ms=thread.updated_at_ms,
-                updated_text=thread.updated_text,
-                model=thread.model,
-                reasoning_effort=thread.reasoning_effort,
-                rollout_path=thread.rollout_path,
-                inspect_status=after_live["status"],
-                status_label=thread.status_label,
-                status_rank=thread.status_rank,
-                open_age_seconds=thread.open_age_seconds,
-                open_age_text=thread.open_age_text,
-                rollout_idle_seconds=thread.rollout_idle_seconds,
-                open_turn=after_live.get("open_turn"),
-                open_turns=after_live.get("open_turns") or [],
-                raw_thread=thread.raw_thread,
-            )
+            refreshed = refreshed_thread_summary(thread, after_live)
             fallback_result = run_fallback_repair(
                 codex_home=codex_home,
                 thread=refreshed,
@@ -763,26 +814,7 @@ def run_one_click_repair(
             append_jsonl(output_dir / "gui_actions.jsonl", result)
             return result
 
-        refreshed = ThreadSummary(
-            thread_id=thread.thread_id,
-            title=thread.title,
-            cwd=thread.cwd,
-            cwd_display=thread.cwd_display,
-            updated_at_ms=thread.updated_at_ms,
-            updated_text=thread.updated_text,
-            model=thread.model,
-            reasoning_effort=thread.reasoning_effort,
-            rollout_path=thread.rollout_path,
-            inspect_status=after_live["status"],
-            status_label=thread.status_label,
-            status_rank=thread.status_rank,
-            open_age_seconds=thread.open_age_seconds,
-            open_age_text=thread.open_age_text,
-            rollout_idle_seconds=thread.rollout_idle_seconds,
-            open_turn=after_live.get("open_turn"),
-            open_turns=after_live.get("open_turns") or [],
-            raw_thread=thread.raw_thread,
-        )
+        refreshed = refreshed_thread_summary(thread, after_live)
         fallback_result = run_fallback_repair(
             codex_home=codex_home,
             thread=refreshed,
@@ -1097,13 +1129,13 @@ class RescueApp:
                 "1. "
                 + bi(
                     "如果最近的 compact 是远端 404 / 模型无权限，一键修复会先尝试 compact-only fallback：仅把压缩会话临时降到 gpt-5.4，不改线程保存下来的正常聊天模型",
-                    "If the latest compact failed remotely with 404 or model access issues, one-click repair first tries a compact-only fallback: it temporarily resumes compaction as gpt-5.4 without changing the thread's stored normal chat model",
+                    "One-click repair first tries to manually push compaction through. For gpt-5.5 it goes straight to gpt-5.4 for compact; other models first try manual compact with the original model, then retry once with gpt-5.4 if needed. This only affects the compact session and does not rewrite the thread's stored normal chat model",
                 )
                 + ".",
                 "2. "
                 + bi(
                     "如果 compact-only fallback 不适用或没有修好，再通过本地 Codex IPC 发送真实 interrupt",
-                    "If compact-only fallback does not apply or does not clear the thread, try a live interrupt through the local Codex IPC pipe",
+                    "If manual compact still does not clear the thread, send a real interrupt through the local Codex IPC pipe",
                 )
                 + ".",
                 "3. "
@@ -1183,7 +1215,7 @@ class RescueApp:
         self.details.see(tk.END)
         self.details.configure(state="disabled")
 
-        if status in {"repaired_live", "repaired_fallback", "repaired_fallback_after_live"}:
+        if status.startswith("repaired_"):
             messagebox.showinfo(APP_TITLE, FRONTEND_REFRESH_TIP)
 
         self.refresh_threads()

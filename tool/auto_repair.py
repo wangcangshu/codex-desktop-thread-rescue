@@ -17,6 +17,7 @@ try:
         select_latest_thread,
         update_thread_timestamp,
     )
+    from .external_compact_fallback import run_external_compact_fallback
 except ImportError:
     from unstick_thread import (
         append_abort_events,
@@ -26,6 +27,7 @@ except ImportError:
         select_latest_thread,
         update_thread_timestamp,
     )
+    from external_compact_fallback import run_external_compact_fallback
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--workspace-filter", default="")
-    parser.add_argument("--min-open-seconds", type=int, default=600)
+    parser.add_argument("--min-open-seconds", type=int, default=180)
     parser.add_argument("--observe-seconds", type=int, default=120)
     parser.add_argument("--cooldown-seconds", type=int, default=1800)
     parser.add_argument("--apply", action="store_true")
@@ -43,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node-command", default="node")
     parser.add_argument("--ipc-timeout-ms", type=int, default=12000)
     parser.add_argument("--ipc-settle-seconds", type=int, default=8)
+    parser.add_argument("--compact-timeout-seconds", type=int, default=120)
     parser.add_argument("--force-on-first-observation", action="store_true")
     return parser.parse_args()
 
@@ -223,6 +226,58 @@ def live_failure_can_fallback(live_result: dict, post_info: dict | None) -> bool
     if not post_info or post_info.get("status") != "orphan_task_started":
         return False
     return classify_live_interrupt_failure(live_result) in {"no-client-found"}
+
+
+def compact_attempt_models(thread: dict) -> list[str]:
+    original_model = str(thread.get("model") or "").strip() or "gpt-5.4"
+    if original_model == "gpt-5.5":
+        return ["gpt-5.4"]
+    if original_model == "gpt-5.4":
+        return ["gpt-5.4"]
+    return [original_model, "gpt-5.4"]
+
+
+def run_compact_assist_until_clear(
+    *,
+    codex_home: Path,
+    thread: dict,
+    rollout_path: Path,
+    output_dir: Path,
+    timeout_seconds: int,
+) -> dict:
+    attempts = []
+
+    for compact_model in compact_attempt_models(thread):
+        compact_result = run_external_compact_fallback(
+            codex_home=codex_home,
+            thread_id=thread["id"],
+            fallback_model=compact_model,
+            timeout_seconds=timeout_seconds,
+            output_dir=output_dir,
+        )
+        post_info = inspect_thread(thread, rollout_path)
+        attempt = {
+            "compact_model": compact_model,
+            "compact_result": compact_result,
+            "post_compact_status": post_info["status"],
+            "post_compact_open_turn": post_info.get("open_turn"),
+        }
+        attempts.append(attempt)
+
+        if post_info["status"] != "orphan_task_started":
+            return {
+                "ok": True,
+                "status": "cleared_by_manual_compact",
+                "attempts": attempts,
+                "final_info": post_info,
+            }
+
+    return {
+        "ok": False,
+        "status": "manual_compact_did_not_clear",
+        "attempts": attempts,
+        "final_info": inspect_thread(thread, rollout_path),
+    }
 
 
 def run_live_interrupt_until_stable(
@@ -448,19 +503,61 @@ def main() -> int:
 
             codex_running = is_codex_running()
             report["codex_running"] = codex_running
-            if codex_running and not args.allow_live_repair:
-                observations[thread_id] = existing
-                save_json(observation_path, observations)
-                report["status"] = "blocked"
-                report["decision"] = "codex_running_live_repair_disabled"
-                print(json.dumps(report, ensure_ascii=False, indent=2))
-                return 0
 
             if not args.apply:
                 observations[thread_id] = existing
                 save_json(observation_path, observations)
-                report["status"] = "repairable_live" if codex_running else "repairable"
-                report["decision"] = "dry_run_only_live_interrupt" if codex_running else "dry_run_only"
+                report["status"] = "repairable_compact_first"
+                report["decision"] = "dry_run_only_compact_first"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            compact_result = run_compact_assist_until_clear(
+                codex_home=codex_home,
+                thread=thread,
+                rollout_path=rollout_path,
+                output_dir=output_dir,
+                timeout_seconds=args.compact_timeout_seconds,
+            )
+            report["compact_assist"] = compact_result
+            observations[thread_id] = existing
+            save_json(observation_path, observations)
+
+            post_compact = compact_result.get("final_info") or inspect_thread(thread, rollout_path)
+            report["post_compact_status"] = post_compact["status"]
+            report["post_compact_open_turn"] = post_compact.get("open_turn")
+
+            if compact_result.get("ok"):
+                existing["last_repaired_at"] = current_time
+                existing["last_repaired_turn_id"] = open_turn["turn_id"]
+                existing["last_compact_assist_at"] = current_time
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+
+                action = {
+                    "timestamp": report["timestamp"],
+                    "thread_id": thread_id,
+                    "title": report["title"],
+                    "turn_id": open_turn["turn_id"],
+                    "repair": {
+                        "mode": "manual_compact_assist",
+                        "result": compact_result,
+                    },
+                    "workspace_filter": args.workspace_filter,
+                    "live_repair": False,
+                }
+                append_action_log(action_log_path, action)
+                report["action"] = action
+                report["status"] = "repaired"
+                report["decision"] = "manual_compact_assist"
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+
+            if codex_running and not args.allow_live_repair:
+                observations[thread_id] = existing
+                save_json(observation_path, observations)
+                report["status"] = "blocked"
+                report["decision"] = "compact_failed_live_repair_disabled"
                 print(json.dumps(report, ensure_ascii=False, indent=2))
                 return 0
 
