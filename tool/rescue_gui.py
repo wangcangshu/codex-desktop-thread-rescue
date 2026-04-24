@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 try:
-    from .auto_repair import is_codex_running, run_live_interrupt
+    from .auto_repair import is_codex_running, run_live_interrupt_until_stable
     from .unstick_thread import (
         append_abort_events_many,
         backup_files,
@@ -24,7 +24,7 @@ try:
         update_thread_timestamp,
     )
 except ImportError:
-    from auto_repair import is_codex_running, run_live_interrupt
+    from auto_repair import is_codex_running, run_live_interrupt_until_stable
     from unstick_thread import (
         append_abort_events_many,
         backup_files,
@@ -314,21 +314,59 @@ def run_one_click_repair(
         return result
 
     if is_codex_running():
-        live_result = run_live_interrupt(
-            thread_id=thread.thread_id,
+        live_result = run_live_interrupt_until_stable(
+            thread=thread.raw_thread,
+            rollout_path=rollout_path,
             node_command=node_command,
             timeout_ms=timeout_ms,
+            settle_seconds=settle_seconds,
         )
         result["live_interrupt"] = live_result
         if not live_result.get("ok"):
-            result["status"] = "live_interrupt_failed"
+            after_live = live_result.get("final_info") or inspect_thread(thread.raw_thread, rollout_path)
+            result["after_live_status"] = after_live["status"]
+            result["after_live_open_turns"] = after_live.get("open_turns") or []
+            result["status"] = (
+                "still_open_after_live"
+                if after_live["status"] == "orphan_task_started"
+                else "live_interrupt_failed"
+            )
+            if result["status"] == "live_interrupt_failed" or not allow_fallback:
+                append_jsonl(output_dir / "gui_actions.jsonl", result)
+                return result
+
+            refreshed = ThreadSummary(
+                thread_id=thread.thread_id,
+                title=thread.title,
+                cwd=thread.cwd,
+                cwd_display=thread.cwd_display,
+                updated_at_ms=thread.updated_at_ms,
+                updated_text=thread.updated_text,
+                model=thread.model,
+                reasoning_effort=thread.reasoning_effort,
+                rollout_path=thread.rollout_path,
+                inspect_status=after_live["status"],
+                status_label=thread.status_label,
+                status_rank=thread.status_rank,
+                open_age_seconds=thread.open_age_seconds,
+                open_age_text=thread.open_age_text,
+                rollout_idle_seconds=thread.rollout_idle_seconds,
+                open_turn=after_live.get("open_turn"),
+                open_turns=after_live.get("open_turns") or [],
+                raw_thread=thread.raw_thread,
+            )
+            fallback_result = run_fallback_repair(
+                codex_home=codex_home,
+                thread=refreshed,
+                output_dir=output_dir,
+                repair_all_open_turns=repair_all_open_turns,
+            )
+            result["fallback"] = fallback_result
+            result["status"] = "repaired_fallback_after_live"
             append_jsonl(output_dir / "gui_actions.jsonl", result)
             return result
 
-        if settle_seconds > 0:
-            time.sleep(settle_seconds)
-
-        after_live = inspect_thread(thread.raw_thread, rollout_path)
+        after_live = live_result.get("final_info") or inspect_thread(thread.raw_thread, rollout_path)
         result["after_live_status"] = after_live["status"]
         result["after_live_open_turns"] = after_live.get("open_turns") or []
         if after_live["status"] != "orphan_task_started":

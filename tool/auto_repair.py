@@ -196,6 +196,108 @@ def run_live_interrupt(
     }
 
 
+def run_live_interrupt_until_stable(
+    *,
+    thread: dict,
+    rollout_path: Path,
+    node_command: str,
+    timeout_ms: int,
+    settle_seconds: int,
+    stability_window_seconds: int = 12,
+    poll_interval_seconds: int = 2,
+    max_attempts: int = 3,
+) -> dict:
+    attempts = []
+
+    for attempt_number in range(1, max_attempts + 1):
+        before = inspect_thread(thread, rollout_path)
+        attempt = {
+            "attempt": attempt_number,
+            "before_status": before["status"],
+            "before_open_turns": before.get("open_turns") or [],
+        }
+
+        if before["status"] != "orphan_task_started":
+            attempt["result"] = "already_clear"
+            attempts.append(attempt)
+            return {
+                "ok": True,
+                "status": "already_clear" if attempt_number == 1 else "cleared_after_retry",
+                "attempts": attempts,
+                "final_info": before,
+            }
+
+        live_result = run_live_interrupt(
+            thread_id=thread["id"],
+            node_command=node_command,
+            timeout_ms=timeout_ms,
+        )
+        attempt["live_interrupt"] = live_result
+        if not live_result.get("ok"):
+            attempt["result"] = "interrupt_failed"
+            attempts.append(attempt)
+            return {
+                "ok": False,
+                "status": "interrupt_failed",
+                "attempts": attempts,
+                "final_info": inspect_thread(thread, rollout_path),
+            }
+
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
+
+        after_settle = inspect_thread(thread, rollout_path)
+        attempt["after_settle_status"] = after_settle["status"]
+        attempt["after_settle_open_turns"] = after_settle.get("open_turns") or []
+
+        if after_settle["status"] == "orphan_task_started":
+            attempt["result"] = "still_open_after_settle"
+            attempts.append(attempt)
+            continue
+
+        stability_probes = []
+        reopened = None
+        deadline = time.time() + max(0, stability_window_seconds)
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            time.sleep(min(max(0.1, poll_interval_seconds), remaining))
+            probe = inspect_thread(thread, rollout_path)
+            stability_probes.append(
+                {
+                    "status": probe["status"],
+                    "open_turns": probe.get("open_turns") or [],
+                }
+            )
+            if probe["status"] == "orphan_task_started":
+                reopened = probe
+                break
+
+        attempt["stability_probes"] = stability_probes
+        if reopened is not None:
+            attempt["result"] = "reopened_within_stability_window"
+            attempt["reopened_open_turns"] = reopened.get("open_turns") or []
+            attempts.append(attempt)
+            continue
+
+        final_info = inspect_thread(thread, rollout_path)
+        attempt["result"] = "stable_clear"
+        attempts.append(attempt)
+        return {
+            "ok": final_info["status"] != "orphan_task_started",
+            "status": "stable_clear" if attempt_number == 1 else "stable_clear_after_retry",
+            "attempts": attempts,
+            "final_info": final_info,
+        }
+
+    final_info = inspect_thread(thread, rollout_path)
+    return {
+        "ok": final_info["status"] != "orphan_task_started",
+        "status": "max_attempts_exceeded",
+        "attempts": attempts,
+        "final_info": final_info,
+    }
+
+
 def main() -> int:
     args = parse_args()
     codex_home = Path(args.codex_home).expanduser()
@@ -334,18 +436,31 @@ def main() -> int:
                 return 0
 
             if codex_running and args.allow_live_repair:
-                live_result = run_live_interrupt(
-                    thread_id=thread_id,
+                live_result = run_live_interrupt_until_stable(
+                    thread=thread,
+                    rollout_path=rollout_path,
                     node_command=args.node_command,
                     timeout_ms=args.ipc_timeout_ms,
+                    settle_seconds=args.ipc_settle_seconds,
                 )
                 report["live_ipc"] = live_result
                 observations[thread_id] = existing
                 save_json(observation_path, observations)
 
                 if not live_result.get("ok"):
-                    report["status"] = "live_interrupt_failed"
-                    report["decision"] = "ipc_interrupt_failed"
+                    post_info = live_result.get("final_info") or inspect_thread(thread, rollout_path)
+                    report["post_interrupt_status"] = post_info["status"]
+                    report["post_interrupt_open_turn"] = post_info.get("open_turn")
+                    report["status"] = (
+                        "live_interrupt_still_reopening"
+                        if post_info["status"] == "orphan_task_started"
+                        else "live_interrupt_failed"
+                    )
+                    report["decision"] = (
+                        "ipc_interrupt_reopened"
+                        if report["status"] == "live_interrupt_still_reopening"
+                        else "ipc_interrupt_failed"
+                    )
                     print(json.dumps(report, ensure_ascii=False, indent=2))
                     return 0
 
@@ -369,10 +484,7 @@ def main() -> int:
                 }
                 append_action_log(action_log_path, action)
 
-                if args.ipc_settle_seconds > 0:
-                    time.sleep(args.ipc_settle_seconds)
-
-                post_info = inspect_thread(thread, rollout_path)
+                post_info = live_result.get("final_info") or inspect_thread(thread, rollout_path)
                 report["post_interrupt_status"] = post_info["status"]
                 report["post_interrupt_open_turn"] = post_info.get("open_turn")
                 report["action"] = action
