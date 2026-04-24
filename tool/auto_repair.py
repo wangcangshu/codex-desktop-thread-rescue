@@ -146,8 +146,9 @@ def parse_json_line(text: str):
     return None
 
 
-def run_live_interrupt(
+def run_ipc_action(
     *,
+    action: str,
     thread_id: str,
     node_command: str,
     timeout_ms: int,
@@ -163,7 +164,7 @@ def run_live_interrupt(
     command = [
         node_command,
         str(helper_path),
-        "interrupt",
+        action,
         thread_id,
         "--timeout-ms",
         str(timeout_ms),
@@ -191,12 +192,41 @@ def run_live_interrupt(
 
     return {
         "ok": bool(result.returncode == 0 and isinstance(payload, dict) and payload.get("status") == "success"),
+        "action": action,
         "command": command,
         "exit_code": result.returncode,
         "stdout": stdout,
         "stderr": stderr,
         "payload": payload,
     }
+
+
+def run_live_interrupt(
+    *,
+    thread_id: str,
+    node_command: str,
+    timeout_ms: int,
+) -> dict:
+    return run_ipc_action(
+        action="interrupt",
+        thread_id=thread_id,
+        node_command=node_command,
+        timeout_ms=timeout_ms,
+    )
+
+
+def run_live_compact(
+    *,
+    thread_id: str,
+    node_command: str,
+    timeout_ms: int,
+) -> dict:
+    return run_ipc_action(
+        action="compact",
+        thread_id=thread_id,
+        node_command=node_command,
+        timeout_ms=timeout_ms,
+    )
 
 
 def classify_live_interrupt_failure(live_result: dict) -> str:

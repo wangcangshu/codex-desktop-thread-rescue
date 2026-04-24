@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -21,6 +21,7 @@ try:
         classify_live_interrupt_failure,
         is_codex_running,
         live_failure_can_fallback,
+        run_live_compact,
         run_live_interrupt_until_stable,
     )
     from .external_compact_fallback import run_external_compact_fallback
@@ -37,6 +38,7 @@ except ImportError:
         classify_live_interrupt_failure,
         is_codex_running,
         live_failure_can_fallback,
+        run_live_compact,
         run_live_interrupt_until_stable,
     )
     from external_compact_fallback import run_external_compact_fallback
@@ -63,7 +65,7 @@ DEFAULT_COMPACT_SETTLE_SECONDS = 45
 FRONTEND_SYNC_WINDOW_SECONDS = 900
 
 FRONTEND_REFRESH_TIP = bi(
-    "重要提示：只有在工具已经修复成功，并且再次刷新检查后确认这个线程已经没有 open turn 的情况下，才适合回到原聊天里发一句很短的话，比如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
+    "重要：只有在工具已经修复成功，并且重新检查后确认这条线程已经没有 open turn 时，才适合回到原聊天里发一句很短的话，例如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
     "Important: only use a short follow-up message such as 'continue' when the tool has already repaired the thread and a fresh re-check shows no open turn. If the thread still shows an open turn, or a new message immediately starts compaction again, do not use a new message as a refresh trick.",
 )
 
@@ -240,11 +242,11 @@ def summarize_compact_error_message(message: str) -> str:
         match = re.search(r"The model `([^`]+)` does not exist or you do not have access to it", message)
         if match:
             return bi(
-                f"远端 compact 失败：模型 {match.group(1)} 不可用或当前账号无权限。",
+                f"远端 compact 失败：模型 {match.group(1)} 不可用，或当前账号无权限。",
                 f"Remote compact failed: model {match.group(1)} is unavailable or not accessible for this account.",
             )
         return bi(
-            "远端 compact 失败：模型不可用或当前账号无权限。",
+            "远端 compact 失败：模型不可用，或当前账号无权限。",
             "Remote compact failed: the model is unavailable or not accessible for this account.",
         )
     if "unexpected status 404 Not Found" in message:
@@ -293,7 +295,7 @@ def load_rollout_compact_state(rollout_path: Path) -> dict | None:
                 "label": bi("最近一次 compact 成功", "Latest compact succeeded"),
                 "time_text": format_local_timestamp(timestamp_ms),
                 "detail": bi(
-                    "后台已经完成了一次上下文压缩。",
+                    "后端已经完成了一次上下文压缩。",
                     "The backend has already completed a context compaction.",
                 ),
             }
@@ -517,19 +519,39 @@ def assess_thread_risk(
 
     if model == "gpt-5.5" and reasoning_effort.lower() == "xhigh":
         score += 2
-        reasons.append(bi("`gpt-5.5 xhigh` 更容易把长线程推回 compact。", "`gpt-5.5 xhigh` is more likely to push long threads back into compaction."))
+        reasons.append(
+            bi(
+                "`gpt-5.5 xhigh` 更容易把长线程推回 compact。",
+                "`gpt-5.5 xhigh` is more likely to push long threads back into compaction.",
+            )
+        )
 
     if compact_event_count >= 20:
         score += 2
-        reasons.append(bi(f"这条线程已经出现很多次 compact 相关事件（{compact_event_count} 次）。", f"This thread has already produced many compact-related events ({compact_event_count})."))
+        reasons.append(
+            bi(
+                f"这条线程已经出现很多次 compact 相关事件（{compact_event_count} 次）。",
+                f"This thread has already produced many compact-related events ({compact_event_count}).",
+            )
+        )
 
     if compact_http_500_count > 0:
         score += 3
-        reasons.append(bi(f"这条线程已经出现 compact `HTTP 500`（{compact_http_500_count} 次）。", f"This thread has already hit compact `HTTP 500` ({compact_http_500_count} times)."))
+        reasons.append(
+            bi(
+                f"这条线程已经出现 compact `HTTP 500`（{compact_http_500_count} 次）。",
+                f"This thread has already hit compact `HTTP 500` ({compact_http_500_count} times).",
+            )
+        )
 
     if compact_send_error_count > 0:
         score += 3
-        reasons.append(bi(f"这条线程已经出现 compact 发送失败（{compact_send_error_count} 次）。", f"This thread has already hit compact send errors ({compact_send_error_count} times)."))
+        reasons.append(
+            bi(
+                f"这条线程已经出现 compact 发送失败（{compact_send_error_count} 次）。",
+                f"This thread has already hit compact send errors ({compact_send_error_count} times).",
+            )
+        )
 
     if inspect_status == "orphan_task_started" or status_rank == "stuck":
         score += 2
@@ -812,9 +834,13 @@ def refreshed_thread_summary(thread: ThreadSummary, info: dict) -> ThreadSummary
         compact_event_count=thread.compact_event_count,
         compact_http_500_count=thread.compact_http_500_count,
         compact_send_error_count=thread.compact_send_error_count,
+        compact_state_kind=thread.compact_state_kind,
+        compact_state_timestamp_ms=thread.compact_state_timestamp_ms,
         compact_state_label=thread.compact_state_label,
         compact_state_time_text=thread.compact_state_time_text,
         compact_state_detail=thread.compact_state_detail,
+        frontend_sync_label=thread.frontend_sync_label,
+        frontend_sync_detail=thread.frontend_sync_detail,
         risk_label=thread.risk_label,
         risk_rank=thread.risk_rank,
         risk_reason=thread.risk_reason,
@@ -827,12 +853,75 @@ def run_compact_assist(
     codex_home: Path,
     thread: ThreadSummary,
     output_dir: Path,
+    node_command: str = "node",
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
     settle_seconds: int = DEFAULT_COMPACT_SETTLE_SECONDS,
     poll_interval_seconds: int = 3,
 ) -> dict:
     rollout_path = Path(thread.rollout_path)
     attempts: list[dict] = []
     after = inspect_thread(thread.raw_thread, rollout_path)
+    if is_codex_running():
+        request_started_ms = int(time.time() * 1000)
+        live_compact = run_live_compact(
+            thread_id=thread.thread_id,
+            node_command=node_command,
+            timeout_ms=timeout_ms,
+        )
+        compact_state = load_thread_compact_state(codex_home, thread.thread_id, rollout_path)
+        settle_probes: list[dict] = []
+        deadline = time.time() + max(0, settle_seconds)
+        while time.time() < deadline:
+            recent_success = bool(
+                compact_state.get("kind") == "success"
+                and compact_state.get("timestamp_ms")
+                and int(compact_state["timestamp_ms"]) >= request_started_ms - 2000
+            )
+            if after["status"] != "orphan_task_started" or recent_success:
+                break
+
+            remaining = deadline - time.time()
+            time.sleep(min(max(0.2, poll_interval_seconds), remaining))
+            after = inspect_thread(thread.raw_thread, rollout_path)
+            compact_state = load_thread_compact_state(codex_home, thread.thread_id, rollout_path)
+            settle_probes.append(
+                {
+                    "status": after["status"],
+                    "open_turns": after.get("open_turns") or [],
+                    "compact_state_kind": compact_state.get("kind"),
+                    "compact_state_label": compact_state.get("label"),
+                    "compact_state_time_text": compact_state.get("time_text"),
+                }
+            )
+
+        recent_success = bool(
+            compact_state.get("kind") == "success"
+            and compact_state.get("timestamp_ms")
+            and int(compact_state["timestamp_ms"]) >= request_started_ms - 2000
+        )
+        live_attempt = {
+            "mode": "live_compact",
+            "live_compact": live_compact,
+            "compact_state": compact_state,
+            "settle_probes": settle_probes,
+            "after_status": after["status"],
+            "after_open_turns": after.get("open_turns") or [],
+            "ok": bool(live_compact.get("ok") and (recent_success or after["status"] != "orphan_task_started")),
+        }
+        attempts.append(live_attempt)
+        if live_attempt["ok"]:
+            result = {
+                "mode": "compact_assist",
+                "thread_id": thread.thread_id,
+                "title": thread.title,
+                "after_status": after["status"],
+                "after_open_turns": after.get("open_turns") or [],
+                "attempts": attempts,
+                "ok": True,
+            }
+            append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
+            return result
+
     for attempt_model in compact_attempt_models(thread):
         external_result = run_external_compact_fallback(
             codex_home=codex_home,
@@ -922,6 +1011,8 @@ def run_one_click_repair(
         codex_home=codex_home,
         thread=thread,
         output_dir=output_dir,
+        node_command=node_command,
+        timeout_ms=timeout_ms,
         settle_seconds=max(DEFAULT_COMPACT_SETTLE_SECONDS, settle_seconds),
     )
     result["compact_assist"] = compact_assist_result
@@ -1019,6 +1110,7 @@ class RescueApp:
         self.root.title(APP_TITLE)
         self.root.geometry("1400x820")
         self.root.minsize(1100, 700)
+        self.root.configure(bg="#f4f7fb")
 
         self.output_dir = ensure_output_dir()
         self.result_queue: queue.Queue = queue.Queue()
@@ -1039,16 +1131,51 @@ class RescueApp:
         self.timeout_ms_var = tk.IntVar(value=DEFAULT_TIMEOUT_MS)
         self.settle_seconds_var = tk.IntVar(value=DEFAULT_SETTLE_SECONDS)
 
+        self.style = ttk.Style()
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+        self.style.configure(".", font=("Segoe UI", 10))
+        self.style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
+        self.style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
+        self.style.configure("TLabelframe", background="#f4f7fb")
+        self.style.configure("TLabelframe.Label", background="#f4f7fb", foreground="#15233b", font=("Segoe UI Semibold", 10))
+
         self._build_ui()
         self.root.after(150, self._poll_queue)
         self.refresh_threads()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=1)
+
+        hero = tk.Frame(self.root, bg="#15233b", padx=18, pady=16)
+        hero.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 10))
+        tk.Label(
+            hero,
+            text=APP_TITLE,
+            bg="#15233b",
+            fg="#ffffff",
+            font=("Segoe UI Semibold", 18),
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            hero,
+            text=bi(
+                "先用真实手动压缩，再用 5.4 回退压缩；如果后台已好而页面不动，再做前端同步。",
+                "Try real manual compact first, then 5.4 fallback compact; if the backend is healed but the page is stale, sync the frontend.",
+            ),
+            bg="#15233b",
+            fg="#dbe7ff",
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=1220,
+        ).pack(anchor="w", pady=(6, 0))
 
         controls = ttk.Frame(self.root, padding=12)
-        controls.grid(row=0, column=0, sticky="ew")
+        controls.grid(row=1, column=0, sticky="ew")
         for column in range(10):
             controls.columnconfigure(column, weight=0)
         controls.columnconfigure(1, weight=1)
@@ -1065,7 +1192,7 @@ class RescueApp:
 
         ttk.Label(controls, text=bi("显示数量", "Limit")).grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Spinbox(controls, from_=5, to=100, textvariable=self.limit_var, width=8).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(10, 0))
-        ttk.Label(controls, text=bi("卡死阈值（秒）", "Stuck Threshold (s)")).grid(row=1, column=2, sticky="w", pady=(10, 0))
+        ttk.Label(controls, text=bi("卡死阈值(秒)", "Stuck Threshold (s)")).grid(row=1, column=2, sticky="w", pady=(10, 0))
         ttk.Spinbox(controls, from_=30, to=3600, increment=30, textvariable=self.stuck_seconds_var, width=10).grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(10, 0))
         ttk.Checkbutton(controls, text=bi("只看疑似卡死", "Only Likely Stuck"), variable=self.only_stuck_var).grid(row=1, column=4, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
@@ -1075,17 +1202,20 @@ class RescueApp:
         ).grid(row=1, column=5, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             controls,
-            text=bi("保守修复时处理全部悬空回合", "Fallback repairs all open turns"),
+            text=bi("兜底修复时处理全部悬空回合", "Fallback repairs all open turns"),
             variable=self.repair_all_turns_var,
         ).grid(row=1, column=6, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
 
-        ttk.Button(controls, text=bi("5.4 压缩", "Compact 5.4"), command=self.compact_selected_gpt54).grid(
+        ttk.Button(controls, text=bi("手动压缩(同模型优先)", "Manual Compact (Same Model First)"), command=self.compact_selected_gpt54).grid(
             row=1, column=8, sticky="ew", padx=(8, 0), pady=(10, 0)
+        )
+        ttk.Button(controls, text=bi("5.4 回退压缩", "5.4 Fallback Compact"), command=self.fallback_compact_selected_gpt54).grid(
+            row=1, column=9, sticky="ew", padx=(8, 0), pady=(10, 0)
         )
 
         ttk.Label(controls, text="Node").grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(controls, textvariable=self.node_command_var, width=12).grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(10, 0))
-        ttk.Label(controls, text=bi("IPC 超时（毫秒）", "IPC Timeout (ms)")).grid(row=2, column=2, sticky="w", pady=(10, 0))
+        ttk.Label(controls, text=bi("IPC 超时(毫秒)", "IPC Timeout (ms)")).grid(row=2, column=2, sticky="w", pady=(10, 0))
         ttk.Spinbox(controls, from_=3000, to=60000, increment=1000, textvariable=self.timeout_ms_var, width=10).grid(
             row=2,
             column=3,
@@ -1093,7 +1223,7 @@ class RescueApp:
             padx=(6, 12),
             pady=(10, 0),
         )
-        ttk.Label(controls, text=bi("等待稳定（秒）", "Settle (s)")).grid(row=2, column=4, sticky="w", pady=(10, 0))
+        ttk.Label(controls, text=bi("等待稳定(秒)", "Settle (s)")).grid(row=2, column=4, sticky="w", pady=(10, 0))
         ttk.Spinbox(controls, from_=0, to=60, textvariable=self.settle_seconds_var, width=8).grid(
             row=2,
             column=5,
@@ -1111,7 +1241,7 @@ class RescueApp:
         )
 
         tip_frame = ttk.LabelFrame(self.root, text=bi("重要提示", "Important Tip"), padding=(12, 8))
-        tip_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        tip_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
         tip_frame.columnconfigure(0, weight=1)
         ttk.Label(
             tip_frame,
@@ -1121,7 +1251,7 @@ class RescueApp:
         ).grid(row=0, column=0, sticky="w")
 
         panes = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
-        panes.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        panes.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
         left = ttk.Frame(panes)
         left.columnconfigure(0, weight=1)
@@ -1178,7 +1308,7 @@ class RescueApp:
         self.details.configure(yscrollcommand=details_scroll.set)
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(12, 6))
-        status_bar.grid(row=3, column=0, sticky="ew")
+        status_bar.grid(row=4, column=0, sticky="ew")
 
     def selected_row(self) -> ThreadSummary | None:
         selection = self.tree.selection()
@@ -1283,8 +1413,8 @@ class RescueApp:
             f"{bi('标题', 'Title')}: {row.title}",
             f"{bi('状态', 'Status')}: {row.status_label}",
             f"{bi('检查状态', 'Inspect Status')}: {row.inspect_status}",
-            f"{bi('Compact 状态', 'Compact State')}: {row.compact_state_label}",
-            f"{bi('Compact 时间', 'Compact Time')}: {row.compact_state_time_text}",
+            f"{bi('压缩状态', 'Compact State')}: {row.compact_state_label}",
+            f"{bi('压缩时间', 'Compact Time')}: {row.compact_state_time_text}",
             f"{bi('工作区', 'Workspace')}: {row.cwd or '-'}",
             f"{bi('更新时间', 'Updated')}: {row.updated_text}",
             f"{bi('模型', 'Model')}: {(row.model + ' ' + row.reasoning_effort).strip()}",
@@ -1294,7 +1424,7 @@ class RescueApp:
             f"{bi('悬空回合数量', 'Open Turn Count')}: {len(row.open_turns)}",
         ]
         if row.compact_state_detail:
-            detail_lines.append(f"{bi('Compact 说明', 'Compact Detail')}: {row.compact_state_detail}")
+            detail_lines.append(f"{bi('压缩说明', 'Compact Detail')}: {row.compact_state_detail}")
         if row.frontend_sync_label:
             detail_lines.append(f"{bi('前端同步提示', 'Frontend Sync Hint')}: {row.frontend_sync_label}")
             detail_lines.append(f"{bi('推荐动作', 'Recommended Action')}: {row.frontend_sync_detail}")
@@ -1312,19 +1442,19 @@ class RescueApp:
                 bi("修复策略", "Repair Strategy") + ":",
                 "1. "
                 + bi(
-                    "如果最近的 compact 是远端 404 / 模型无权限，一键修复会先尝试 compact-only fallback：仅把压缩会话临时降到 gpt-5.4，不改线程保存下来的正常聊天模型",
-                    "One-click repair first tries to manually push compaction through. For gpt-5.5 it goes straight to gpt-5.4 for compact; other models first try manual compact with the original model, then retry once with gpt-5.4 if needed. This only affects the compact session and does not rewrite the thread's stored normal chat model",
+                    "一键修复会先尝试手动推进压缩。默认先走和终端手动压缩一致的同模型压缩；如果最近的 compact 像是 gpt-5.5 的远端拒绝或模型权限问题，再回退到只给 compact 临时使用 gpt-5.4。",
+                    "One-click repair first tries to manually push compaction through. It prefers the same-model compact path that terminal/manual compaction uses. If recent compact signals look like a gpt-5.5 remote reject or model-access problem, it falls back to using gpt-5.4 only for the compact step.",
                 )
                 + ".",
                 "2. "
                 + bi(
-                    "如果 compact-only fallback 不适用或没有修好，再通过本地 Codex IPC 发送真实 interrupt",
+                    "如果手动压缩没有把线程拉回来，再通过本地 Codex IPC 发送真实 interrupt。",
                     "If manual compact still does not clear the thread, send a real interrupt through the local Codex IPC pipe",
                 )
                 + ".",
                 "3. "
                 + bi(
-                    "如果仍然卡住，并且你允许保守修复，就在本地追加 turn_aborted 并自动备份",
+                    "如果仍然卡住，并且你允许保守修复，就在本地追加 turn_aborted，并先自动备份。",
                     "If still stuck and fallback is allowed, append turn_aborted locally with backups",
                 )
                 + ".",
@@ -1358,7 +1488,7 @@ class RescueApp:
             proceed = messagebox.askyesno(
                 APP_TITLE,
                 bi(
-                    "这个线程看起来仍然像是活跃中，而不是明确卡死。\n\n你仍然要尝试修复吗？",
+                    "杩欎釜绾跨▼鐪嬭捣鏉ヤ粛鐒跺儚鏄椿璺冧腑锛岃€屼笉鏄槑纭崱姝汇€俓n\n浣犱粛鐒惰灏濊瘯淇鍚楋紵",
                     "This thread still looks active rather than clearly stuck.\n\nDo you want to try a repair anyway?",
                 ),
             )
@@ -1387,10 +1517,10 @@ class RescueApp:
 
         self.run_background(bi("正在修复选中线程...", "Repairing selected thread..."), task, self.on_repair_complete)
 
-    def compact_selected_gpt54(self) -> None:
+    def fallback_compact_selected_gpt54(self) -> None:
         row = self.selected_row()
         if not row:
-            messagebox.showinfo(APP_TITLE, bi("璇峰厛閫変腑涓€涓嚎绋嬨€?", "Select a thread first."))
+            messagebox.showinfo(APP_TITLE, bi("请先选中一个线程。", "Select a thread first."))
             return
 
         codex_home = Path(self.codex_home_var.get()).expanduser()
@@ -1412,14 +1542,14 @@ class RescueApp:
             }
 
         self.run_background(
-            bi("姝ｅ湪鐢?gpt-5.4 鎵嬪姩鍘嬬缉...", "Running manual gpt-5.4 compaction..."),
+            bi("正在执行 5.4 回退压缩...", "Running 5.4 fallback compaction..."),
             task,
-            self.on_compact_only_complete,
+            self.on_fallback_compact_complete,
         )
 
     def on_repair_complete(self, payload: dict) -> None:
         status = payload.get("status", "unknown")
-        self.status_var.set(f"{bi('修复完成', 'Repair finished')}: {status}")
+        self.status_var.set(f"{bi('淇瀹屾垚', 'Repair finished')}: {status}")
 
         self.details.configure(state="normal")
         self.details.insert(
@@ -1434,17 +1564,17 @@ class RescueApp:
 
         self.refresh_threads()
 
-    def on_compact_only_complete(self, payload: dict) -> None:
+    def on_fallback_compact_complete(self, payload: dict) -> None:
         result = payload.get("result") or {}
         compact_outcome = result.get("compact_outcome") or {}
         status = result.get("status", "unknown")
         outcome = compact_outcome.get("status") or compact_outcome.get("kind") or "-"
-        self.status_var.set(f"{bi('5.4 鍘嬬缉瀹屾垚', '5.4 compaction finished')}: {status} / {outcome}")
+        self.status_var.set(f"{bi('5.4 压缩完成', '5.4 compaction finished')}: {status} / {outcome}")
 
         self.details.configure(state="normal")
         self.details.insert(
             tk.END,
-            "\n\n" + bi("鏈€杩戜竴娆?5.4 鍘嬬缉缁撴灉", "Last 5.4 Compaction Result") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+            "\n\n" + bi("最近一次 5.4 回退压缩结果", "Last 5.4 Fallback Compaction Result") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
         )
         self.details.see(tk.END)
         self.details.configure(state="disabled")
@@ -1459,70 +1589,77 @@ class RescueApp:
 
         codex_home = Path(self.codex_home_var.get()).expanduser()
         output_dir = self.output_dir
-        rollout_path = Path(row.rollout_path)
+        node_command = self.node_command_var.get().strip() or "node"
+        timeout_ms = max(3000, int(self.timeout_ms_var.get() or DEFAULT_TIMEOUT_MS))
+        settle_seconds = max(0, int(self.settle_seconds_var.get() or DEFAULT_SETTLE_SECONDS))
 
         def task():
-            result = run_external_compact_fallback(
+            result = run_compact_assist(
                 codex_home=codex_home,
-                thread_id=row.thread_id,
-                fallback_model="gpt-5.4",
-                timeout_seconds=120,
+                thread=row,
                 output_dir=output_dir,
+                node_command=node_command,
+                timeout_ms=timeout_ms,
+                settle_seconds=max(DEFAULT_COMPACT_SETTLE_SECONDS, settle_seconds),
             )
-            after = inspect_thread(row.raw_thread, rollout_path)
             return {
                 "timestamp": utc_timestamp(),
-                "mode": "compact_only_gpt54",
+                "mode": "manual_compact_then_fallback",
                 "thread_id": row.thread_id,
                 "title": row.title,
                 "result": result,
-                "after_status": after["status"],
-                "after_open_turns": after.get("open_turns") or [],
+                "after_status": result.get("after_status"),
+                "after_open_turns": result.get("after_open_turns") or [],
             }
 
         self.run_background(
-            bi("正在执行 gpt-5.4 手动压缩...", "Running manual gpt-5.4 compaction..."),
+            bi("正在手动压缩线程...", "Running manual thread compaction..."),
             task,
-            self.on_compact_only_complete,
+            self.on_manual_compact_complete,
         )
 
-    def on_compact_only_complete(self, payload: dict) -> None:
+    def on_manual_compact_complete(self, payload: dict) -> None:
         result = payload.get("result") or {}
-        compact_outcome = result.get("compact_outcome") or {}
+        attempts = result.get("attempts") or []
+        last_attempt = attempts[-1] if attempts else {}
+        outcome = (
+            ((last_attempt.get("live_compact") or {}).get("payload") or {}).get("status")
+            or ((last_attempt.get("external_result") or {}).get("compact_outcome") or {}).get("status")
+            or ((last_attempt.get("external_result") or {}).get("compact_outcome") or {}).get("kind")
+            or "-"
+        )
         status = result.get("status", "unknown")
-        outcome = compact_outcome.get("status") or compact_outcome.get("kind") or "-"
-        after_status = payload.get("after_status") or "-"
+        after_status = payload.get("after_status") or result.get("after_status") or "-"
         self.status_var.set(
-            f"{bi('5.4 压缩完成', '5.4 compaction finished')}: {status} / {outcome} / {bi('后置状态', 'After')}: {after_status}"
+            f"{bi('手动压缩完成', 'Manual compaction finished')}: {status} / {outcome} / {bi('后置状态', 'After')}: {after_status}"
         )
 
         self.details.configure(state="normal")
         self.details.insert(
             tk.END,
-            "\n\n" + bi("最近一次 5.4 压缩结果", "Last 5.4 Compaction Result") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+            "\n\n" + bi("最近一次手动压缩结果", "Last Manual Compaction Result") + ":\n" + json.dumps(payload, ensure_ascii=False, indent=2),
         )
         self.details.see(tk.END)
         self.details.configure(state="disabled")
 
-        compact_ok = bool(status == "compact_succeeded" or compact_outcome.get("ok"))
+        compact_ok = bool(result.get("ok"))
         if compact_ok and after_status == "no_open_turn":
             messagebox.showinfo(
                 APP_TITLE,
                 bi(
-                    "后台已经压好了。如果聊天页还是旧画面，先点“软刷新前端”；如果还不变，再点“只重载界面层”。",
+                    "后台压缩已经完成。如果聊天页还是旧画面，先点‘软刷新前端’；如果还不变，再点‘只重载界面层’。",
                     "The backend compaction has finished. If the chat page is still stale, use Soft Reload UI first; if that still does not sync it, use Restart Renderer Only.",
                 ),
             )
 
         self.refresh_threads()
-
     def soft_reload_ui(self) -> None:
         row = self.selected_row()
         if row and row.inspect_status == "orphan_task_started":
             proceed = messagebox.askyesno(
                 APP_TITLE,
                 bi(
-                    "当前选中线程还显示有 open turn。软刷新前端更适合“后台已好但页面没刷新”的情况。\n\n仍然继续吗？",
+                    "当前选中线程仍然显示有 open turn。软刷新前端更适合“后台已好但页面没刷新”的情况。\n\n仍然继续吗？",
                     "The selected thread still has an open turn. Soft Reload UI is mainly for when the backend is already healed but the page stayed stale.\n\nDo you want to continue anyway?",
                 ),
             )
@@ -1539,7 +1676,7 @@ class RescueApp:
         proceed = messagebox.askyesno(
             APP_TITLE,
             bi(
-                "这一步会只重载 Codex 的界面层，不会重启整个 App。\n\n如果终端任务已经跑完，但聊天页还是旧画面，这通常是下一步。\n\n继续吗？",
+                "这一步只会重载 Codex 的界面层，不会重启整个 App。\n\n如果终端任务已经跑完，但聊天页还是旧画面，这通常是下一步。\n\n继续吗？",
                 "This reloads only the Codex UI layer, not the whole app.\n\nUse it when terminal work is done but the chat page is still stale.\n\nContinue?",
             ),
         )
@@ -1600,3 +1737,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

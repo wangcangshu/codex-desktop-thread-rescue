@@ -28,18 +28,28 @@ function printJson(payload) {
 function parseArgs(argv) {
   if (argv.length < 2) {
     throw new Error(
-      "Usage: codex_ipc_control.js <interrupt|compact> <thread-id> [--timeout-ms <ms>]"
+      "Usage: codex_ipc_control.js <interrupt|compact|set-model> <thread-id> [model reasoning-effort] [--timeout-ms <ms>]"
     );
   }
 
   const action = argv[0];
   const threadId = argv[1];
   let timeoutMs = 12000;
+  let actionArgs = argv.slice(2);
 
-  for (let i = 2; i < argv.length; i += 1) {
-    const token = argv[i];
+  if (action === "set-model") {
+    if (argv.length < 4) {
+      throw new Error(
+        "Usage: codex_ipc_control.js set-model <thread-id> <model> <reasoning-effort> [--timeout-ms <ms>]"
+      );
+    }
+    actionArgs = argv.slice(4);
+  }
+
+  for (let i = 0; i < actionArgs.length; i += 1) {
+    const token = actionArgs[i];
     if (token === "--timeout-ms") {
-      timeoutMs = Number(argv[i + 1]);
+      timeoutMs = Number(actionArgs[i + 1]);
       i += 1;
       continue;
     }
@@ -70,6 +80,27 @@ function parseArgs(argv) {
         threadId,
         timeoutMs,
       };
+    case "set-model": {
+      const model = argv[2];
+      const reasoningEffort = argv[3];
+      if (!model || !model.trim()) {
+        throw new Error("Model is required for set-model.");
+      }
+      if (!reasoningEffort || !reasoningEffort.trim()) {
+        throw new Error("Reasoning effort is required for set-model.");
+      }
+      return {
+        action,
+        method: "thread-follower-set-model-and-reasoning",
+        params: {
+          conversationId: threadId,
+          model,
+          reasoningEffort,
+        },
+        threadId,
+        timeoutMs,
+      };
+    }
     default:
       throw new Error(`Unsupported action: ${action}`);
   }
