@@ -259,6 +259,9 @@ def run_compact_assist_until_clear(
         )
         post_info = inspect_thread(thread, rollout_path)
         compact_outcome = (compact_result.get("compact_outcome") or {})
+        compact_succeeded = bool(
+            compact_result.get("status") == "compact_succeeded" or compact_outcome.get("ok")
+        )
         started_compaction = any(
             ((n.get("method") == "item/started") and (((n.get("params") or {}).get("item") or {}).get("type") == "contextCompaction"))
             for n in (compact_outcome.get("notifications") or [])
@@ -282,6 +285,7 @@ def run_compact_assist_until_clear(
         attempt = {
             "compact_model": compact_model,
             "compact_result": compact_result,
+            "compact_succeeded": compact_succeeded,
             "started_compaction": started_compaction,
             "settle_probes": settle_probes,
             "post_compact_status": post_info["status"],
@@ -293,6 +297,13 @@ def run_compact_assist_until_clear(
             return {
                 "ok": True,
                 "status": "cleared_by_manual_compact",
+                "attempts": attempts,
+                "final_info": post_info,
+            }
+        if compact_succeeded:
+            return {
+                "ok": True,
+                "status": "manual_compact_succeeded_but_open_turn_remains",
                 "attempts": attempts,
                 "final_info": post_info,
             }

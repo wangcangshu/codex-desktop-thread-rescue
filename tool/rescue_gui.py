@@ -708,6 +708,9 @@ def run_compact_assist(
         )
         after = inspect_thread(thread.raw_thread, rollout_path)
         compact_outcome = (external_result.get("compact_outcome") or {})
+        compact_succeeded = bool(
+            external_result.get("status") == "compact_succeeded" or compact_outcome.get("ok")
+        )
         started_compaction = any(
             ((n.get("method") == "item/started") and (((n.get("params") or {}).get("item") or {}).get("type") == "contextCompaction"))
             for n in (compact_outcome.get("notifications") or [])
@@ -731,11 +734,12 @@ def run_compact_assist(
         attempt = {
             "compact_model": attempt_model,
             "external_result": external_result,
+            "compact_succeeded": compact_succeeded,
             "started_compaction": started_compaction,
             "settle_probes": settle_probes,
             "after_status": after["status"],
             "after_open_turns": after.get("open_turns") or [],
-            "ok": after["status"] != "orphan_task_started",
+            "ok": after["status"] != "orphan_task_started" or compact_succeeded,
         }
         attempts.append(attempt)
         if attempt["ok"]:
@@ -748,7 +752,7 @@ def run_compact_assist(
         "after_status": after["status"],
         "after_open_turns": after.get("open_turns") or [],
         "attempts": attempts,
-        "ok": after["status"] != "orphan_task_started",
+        "ok": bool(attempts and attempts[-1].get("ok")),
     }
     append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
     return result
@@ -787,7 +791,11 @@ def run_one_click_repair(
     )
     result["compact_assist"] = compact_assist_result
     if compact_assist_result.get("ok"):
-        result["status"] = "repaired_compact_assist"
+        result["status"] = (
+            "compaction_succeeded"
+            if compact_assist_result.get("after_status") == "orphan_task_started"
+            else "repaired_compact_assist"
+        )
         append_jsonl(output_dir / "gui_actions.jsonl", result)
         return result
 
