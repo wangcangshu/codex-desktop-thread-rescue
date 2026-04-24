@@ -196,6 +196,35 @@ def run_live_interrupt(
     }
 
 
+def classify_live_interrupt_failure(live_result: dict) -> str:
+    attempts = live_result.get("attempts") or []
+    if attempts:
+        nested = attempts[-1].get("live_interrupt")
+        if isinstance(nested, dict) and nested is not live_result:
+            nested_reason = classify_live_interrupt_failure(nested)
+            if nested_reason != "unknown":
+                return nested_reason
+
+    payload = live_result.get("payload") or {}
+    response = payload.get("response") or {}
+
+    if response.get("error"):
+        return str(response["error"])
+    if payload.get("error"):
+        return str(payload["error"])
+    if live_result.get("error"):
+        return str(live_result["error"])
+    if payload.get("status") and payload.get("status") != "success":
+        return str(payload["status"])
+    return "unknown"
+
+
+def live_failure_can_fallback(live_result: dict, post_info: dict | None) -> bool:
+    if not post_info or post_info.get("status") != "orphan_task_started":
+        return False
+    return classify_live_interrupt_failure(live_result) in {"no-client-found"}
+
+
 def run_live_interrupt_until_stable(
     *,
     thread: dict,
@@ -449,8 +478,57 @@ def main() -> int:
 
                 if not live_result.get("ok"):
                     post_info = live_result.get("final_info") or inspect_thread(thread, rollout_path)
+                    failure_reason = classify_live_interrupt_failure(live_result)
                     report["post_interrupt_status"] = post_info["status"]
                     report["post_interrupt_open_turn"] = post_info.get("open_turn")
+                    report["live_interrupt_failure_reason"] = failure_reason
+                    if live_failure_can_fallback(live_result, post_info):
+                        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                        backup_dir = output_dir / "backups" / thread_id / stamp
+                        rollout_backup, state_backup = backup_files(backup_dir, rollout_path, state_db)
+                        append_info = append_abort_events(
+                            rollout_path=rollout_path,
+                            turn_id=post_info["open_turn"]["turn_id"],
+                            started_at=post_info["open_turn"].get("started_at"),
+                        )
+                        update_thread_timestamp(
+                            state_db=state_db,
+                            thread_id=thread_id,
+                            completed_at=append_info["completed_at"],
+                            completed_at_ms=append_info["completed_at_ms"],
+                        )
+
+                        existing["last_repaired_at"] = current_time
+                        existing["last_repaired_turn_id"] = post_info["open_turn"]["turn_id"]
+                        existing["last_live_interrupt_at"] = current_time
+                        observations[thread_id] = existing
+                        save_json(observation_path, observations)
+
+                        action = {
+                            "timestamp": report["timestamp"],
+                            "thread_id": thread_id,
+                            "title": report["title"],
+                            "turn_id": post_info["open_turn"]["turn_id"],
+                            "backup_dir": str(backup_dir),
+                            "backup_rollout": str(rollout_backup),
+                            "backup_state_db": str(state_backup),
+                            "repair": {
+                                "mode": "fallback_after_no_client",
+                                "live_result": live_result,
+                                "append_info": append_info,
+                            },
+                            "workspace_filter": args.workspace_filter,
+                            "live_repair": True,
+                        }
+                        append_action_log(action_log_path, action)
+                        report["action"] = action
+                        report["post_interrupt_status"] = "no_open_turn"
+                        report["post_interrupt_open_turn"] = None
+                        report["status"] = "repaired"
+                        report["decision"] = "fallback_after_no_client"
+                        print(json.dumps(report, ensure_ascii=False, indent=2))
+                        return 0
+
                     report["status"] = (
                         "live_interrupt_still_reopening"
                         if post_info["status"] == "orphan_task_started"

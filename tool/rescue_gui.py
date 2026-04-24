@@ -14,7 +14,12 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 try:
-    from .auto_repair import is_codex_running, run_live_interrupt_until_stable
+    from .auto_repair import (
+        classify_live_interrupt_failure,
+        is_codex_running,
+        live_failure_can_fallback,
+        run_live_interrupt_until_stable,
+    )
     from .unstick_thread import (
         append_abort_events_many,
         backup_files,
@@ -24,7 +29,12 @@ try:
         update_thread_timestamp,
     )
 except ImportError:
-    from auto_repair import is_codex_running, run_live_interrupt_until_stable
+    from auto_repair import (
+        classify_live_interrupt_failure,
+        is_codex_running,
+        live_failure_can_fallback,
+        run_live_interrupt_until_stable,
+    )
     from unstick_thread import (
         append_abort_events_many,
         backup_files,
@@ -46,8 +56,8 @@ DEFAULT_SETTLE_SECONDS = 6
 DEFAULT_TIMEOUT_MS = 12000
 
 FRONTEND_REFRESH_TIP = bi(
-    "重要提示：如果工具已经修复成功，右下角也提示完成，但聊天窗口还停在“正在自动压缩上下文”，先不要急着重启。请回到原聊天里随便发一句简单的话，比如“继续”，然后稍微等一会。前端通常会刷新，并显示上下文其实已经压缩完成。",
-    "Important: if the tool already reports success but the chat window still shows automatic context compaction, do not restart immediately. Go back to the original chat, send a short message such as 'continue', then wait a moment. The frontend often refreshes and shows that compaction has already finished.",
+    "重要提示：只有在工具已经修复成功，并且再次刷新检查后确认这个线程已经没有 open turn 的情况下，才适合回到原聊天里发一句很短的话，比如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
+    "Important: only use a short follow-up message such as 'continue' when the tool has already repaired the thread and a fresh re-check shows no open turn. If the thread still shows an open turn, or a new message immediately starts compaction again, do not use a new message as a refresh trick.",
 )
 
 STATUS_TEXT = {
@@ -324,14 +334,17 @@ def run_one_click_repair(
         result["live_interrupt"] = live_result
         if not live_result.get("ok"):
             after_live = live_result.get("final_info") or inspect_thread(thread.raw_thread, rollout_path)
+            failure_reason = classify_live_interrupt_failure(live_result)
             result["after_live_status"] = after_live["status"]
             result["after_live_open_turns"] = after_live.get("open_turns") or []
+            result["live_interrupt_failure_reason"] = failure_reason
             result["status"] = (
                 "still_open_after_live"
                 if after_live["status"] == "orphan_task_started"
                 else "live_interrupt_failed"
             )
-            if result["status"] == "live_interrupt_failed" or not allow_fallback:
+            allow_fallback_after_failure = live_failure_can_fallback(live_result, after_live)
+            if (result["status"] == "live_interrupt_failed" and not allow_fallback_after_failure) or not allow_fallback:
                 append_jsonl(output_dir / "gui_actions.jsonl", result)
                 return result
 
