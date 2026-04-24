@@ -122,6 +122,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 - If that still does not refresh the UI, switch to another conversation and then switch back.
 - If a stuck thread has been compacting for around 3 minutes with no progress, treat it as likely stuck and let the tool try manual compaction before reaching for interrupt.
 - Manual compaction can take a little longer than a plain interrupt repair. Give it a short moment before assuming it failed.
+- If manual compaction has clearly started, the tool now gives it a settle window first instead of immediately dropping into interrupt.
 - Avoid mixing restart, model switching, branching, and terminal compaction randomly, because it makes the failure harder to understand.
 
 ## 使用小贴士

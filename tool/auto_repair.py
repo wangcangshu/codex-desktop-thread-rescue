@@ -244,6 +244,8 @@ def run_compact_assist_until_clear(
     rollout_path: Path,
     output_dir: Path,
     timeout_seconds: int,
+    settle_seconds: int = 45,
+    poll_interval_seconds: int = 3,
 ) -> dict:
     attempts = []
 
@@ -256,9 +258,32 @@ def run_compact_assist_until_clear(
             output_dir=output_dir,
         )
         post_info = inspect_thread(thread, rollout_path)
+        compact_outcome = (compact_result.get("compact_outcome") or {})
+        started_compaction = any(
+            ((n.get("method") == "item/started") and (((n.get("params") or {}).get("item") or {}).get("type") == "contextCompaction"))
+            for n in (compact_outcome.get("notifications") or [])
+        )
+        settle_probes = []
+        if post_info["status"] == "orphan_task_started" and started_compaction and settle_seconds > 0:
+            deadline = time.time() + max(0, settle_seconds)
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                time.sleep(min(max(0.2, poll_interval_seconds), remaining))
+                probe = inspect_thread(thread, rollout_path)
+                settle_probes.append(
+                    {
+                        "status": probe["status"],
+                        "open_turns": probe.get("open_turns") or [],
+                    }
+                )
+                post_info = probe
+                if post_info["status"] != "orphan_task_started":
+                    break
         attempt = {
             "compact_model": compact_model,
             "compact_result": compact_result,
+            "started_compaction": started_compaction,
+            "settle_probes": settle_probes,
             "post_compact_status": post_info["status"],
             "post_compact_open_turn": post_info.get("open_turn"),
         }

@@ -58,6 +58,7 @@ DEFAULT_LIMIT = 25
 DEFAULT_STUCK_SECONDS = 180
 DEFAULT_SETTLE_SECONDS = 6
 DEFAULT_TIMEOUT_MS = 12000
+DEFAULT_COMPACT_SETTLE_SECONDS = 45
 
 FRONTEND_REFRESH_TIP = bi(
     "重要提示：只有在工具已经修复成功，并且再次刷新检查后确认这个线程已经没有 open turn 的情况下，才适合回到原聊天里发一句很短的话，比如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
@@ -691,6 +692,8 @@ def run_compact_assist(
     codex_home: Path,
     thread: ThreadSummary,
     output_dir: Path,
+    settle_seconds: int = DEFAULT_COMPACT_SETTLE_SECONDS,
+    poll_interval_seconds: int = 3,
 ) -> dict:
     rollout_path = Path(thread.rollout_path)
     attempts: list[dict] = []
@@ -704,9 +707,32 @@ def run_compact_assist(
             output_dir=output_dir,
         )
         after = inspect_thread(thread.raw_thread, rollout_path)
+        compact_outcome = (external_result.get("compact_outcome") or {})
+        started_compaction = any(
+            ((n.get("method") == "item/started") and (((n.get("params") or {}).get("item") or {}).get("type") == "contextCompaction"))
+            for n in (compact_outcome.get("notifications") or [])
+        )
+        settle_probes: list[dict] = []
+        if after["status"] == "orphan_task_started" and started_compaction and settle_seconds > 0:
+            deadline = time.time() + max(0, settle_seconds)
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                time.sleep(min(max(0.2, poll_interval_seconds), remaining))
+                probe = inspect_thread(thread.raw_thread, rollout_path)
+                settle_probes.append(
+                    {
+                        "status": probe["status"],
+                        "open_turns": probe.get("open_turns") or [],
+                    }
+                )
+                after = probe
+                if after["status"] != "orphan_task_started":
+                    break
         attempt = {
             "compact_model": attempt_model,
             "external_result": external_result,
+            "started_compaction": started_compaction,
+            "settle_probes": settle_probes,
             "after_status": after["status"],
             "after_open_turns": after.get("open_turns") or [],
             "ok": after["status"] != "orphan_task_started",
@@ -757,6 +783,7 @@ def run_one_click_repair(
         codex_home=codex_home,
         thread=thread,
         output_dir=output_dir,
+        settle_seconds=max(DEFAULT_COMPACT_SETTLE_SECONDS, settle_seconds),
     )
     result["compact_assist"] = compact_assist_result
     if compact_assist_result.get("ok"):

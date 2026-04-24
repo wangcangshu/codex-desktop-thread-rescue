@@ -77,15 +77,20 @@ class ServerEvent:
 
 class AppServerClient:
     def __init__(self) -> None:
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         self.process = subprocess.Popen(
             ["cmd.exe", "/c", "codex", "app-server", "--listen", "stdio://"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            **popen_kwargs,
         )
         self.events: queue.Queue[ServerEvent] = queue.Queue()
         self._start_reader(self.process.stdout, "stdout")
