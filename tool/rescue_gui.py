@@ -65,8 +65,13 @@ DEFAULT_COMPACT_SETTLE_SECONDS = 45
 FRONTEND_SYNC_WINDOW_SECONDS = 900
 
 FRONTEND_REFRESH_TIP = bi(
-    "重要：只有在工具已经修复成功，并且重新检查后确认这条线程已经没有 open turn 时，才适合回到原聊天里发一句很短的话，例如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
-    "Important: only use a short follow-up message such as 'continue' when the tool has already repaired the thread and a fresh re-check shows no open turn. If the thread still shows an open turn, or a new message immediately starts compaction again, do not use a new message as a refresh trick.",
+    "重要：如果已经显示“压缩完成”，但聊天页还是旧画面，或者背景信息窗口里的小圈已经满格却没有重置，这通常是前端没同步，不代表压缩还没完成。只有在工具已经修复成功，并且重新检查后确认这条线程已经没有 open turn 时，才适合回到原聊天里发一句很短的话，例如“继续”，来刷新前端显示。如果线程仍然显示 open turn，或者你一发消息它又开始压缩，就不要把发消息当成刷新手段。",
+    "Important: if compaction is already shown as completed, but the chat page is still stale, or the small progress circle in the background-info panel stays full and does not reset, that usually means the frontend did not sync. It does not necessarily mean compaction is still running. Only use a short follow-up message such as 'continue' when the tool has already repaired the thread and a fresh re-check shows no open turn. If the thread still shows an open turn, or a new message immediately starts compaction again, do not use a new message as a refresh trick.",
+)
+
+RELOAD_DISABLED_TIP = bi(
+    "最新 Codex 更新后，这个工具里的界面层重载容易触发 `mismatched path`，导致线程无法恢复。为了避免再把线程搞坏，GUI 里的重载按钮已临时停用。",
+    "After the latest Codex updates, the GUI reload actions can trigger `mismatched path` and make a thread fail to resume. To avoid damaging threads again, the reload buttons are temporarily disabled in the GUI.",
 )
 
 STATUS_TEXT = {
@@ -424,6 +429,119 @@ def load_thread_compact_state(codex_home: Path, thread_id: str, rollout_path: Pa
     return default_state
 
 
+def load_recent_compact_trace(codex_home: Path, thread_id: str, min_ts_s: int) -> dict:
+    logs_db = codex_home / "logs_2.sqlite"
+    result = {
+        "kind": "none",
+        "saw_activity": False,
+        "timestamp_ms": None,
+        "time_text": "-",
+        "detail": bi(
+            "没有看到这次新压缩的链路活动。",
+            "No new compact activity was seen for this attempt.",
+        ),
+    }
+    if not logs_db.exists():
+        return result
+
+    conn = sqlite3.connect(str(logs_db))
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select ts, feedback_log_body
+            from logs
+            where thread_id = ?
+              and ts >= ?
+              and (
+                feedback_log_body like ?
+                or feedback_log_body like ?
+                or feedback_log_body like ?
+              )
+            order by ts asc, id asc
+            """,
+            (
+                thread_id,
+                int(min_ts_s),
+                '%api.path="responses/compact"%',
+                "%http.response.status_code=%",
+                f"%{COMPACT_SEND_ERROR_TEXT}%",
+            ),
+        ).fetchall()
+    except Exception:
+        return result
+    finally:
+        conn.close()
+
+    if not rows:
+        return result
+
+    saw_activity = False
+    latest_ts = None
+    latest_body = ""
+    status_code = None
+    send_error = False
+
+    for row in rows:
+        ts = int(row["ts"])
+        body = row["feedback_log_body"] or ""
+        if 'api.path="responses/compact"' in body:
+            saw_activity = True
+            latest_ts = ts
+            latest_body = body
+        if COMPACT_SEND_ERROR_TEXT in body:
+            saw_activity = True
+            send_error = True
+            latest_ts = ts
+            latest_body = body
+        match = COMPACT_HTTP_STATUS_RE.search(body)
+        if match:
+            saw_activity = True
+            status_code = int(match.group(1))
+            latest_ts = ts
+            latest_body = body
+
+    if latest_ts is not None:
+        result["timestamp_ms"] = latest_ts * 1000
+        result["time_text"] = format_log_timestamp(latest_ts)
+    result["saw_activity"] = saw_activity
+
+    if send_error:
+        result["kind"] = "failure"
+        result["detail"] = bi(
+            "这次新压缩已经发起，但 compact 请求发送失败了。",
+            "This compact attempt was started, but the compact request failed to send.",
+        )
+        return result
+
+    if status_code is not None:
+        result["kind"] = "success" if status_code == 200 else "failure"
+        result["detail"] = (
+            bi(
+                "这次新压缩已经完成并返回 200。",
+                "This compact attempt completed and returned 200.",
+            )
+            if status_code == 200
+            else bi(
+                f"这次新压缩返回了 HTTP {status_code}。",
+                f"This compact attempt returned HTTP {status_code}.",
+            )
+        )
+        return result
+
+    if saw_activity:
+        result["kind"] = "activity"
+        result["detail"] = bi(
+            "这次新压缩已经开始触发 `/responses/compact`，但还没有看到成功或失败收尾。",
+            "This compact attempt has already reached `/responses/compact`, but no success or failure outcome has appeared yet.",
+        )
+        return result
+
+    if latest_body:
+        result["detail"] = latest_body[:300]
+    return result
+
+
 def determine_frontend_sync_hint(
     *,
     inspect_status: str,
@@ -440,8 +558,8 @@ def determine_frontend_sync_hint(
     return (
         bi("后台已经压好，前端可能没刷新", "Backend compacted; UI may be stale"),
         bi(
-            "先点“软刷新前端”。如果聊天页还是旧画面，再点“只重载界面层”。这两步只应该在没有 open turn 的前提下做。",
-            "Try Soft Reload UI first. If the chat page is still stale, use Restart Renderer Only. Only do this when the thread has no open turn.",
+            "这类情况说明后台大概率已经压好，但前端没同步。当前版本里不要再用工具里的重载按钮，以免触发 `mismatched path`。先只把它当成“后台已好”的提示。",
+            "This usually means the backend compacted successfully but the frontend did not sync. In the current version, do not use the GUI reload buttons again because they can trigger `mismatched path`. Treat this as a backend-healed signal only.",
         ),
     )
 
@@ -502,6 +620,27 @@ $after = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Codex.exe
         "payload": payload,
         "stderr": (result.stderr or "").strip(),
     }
+
+
+def frontend_reload_guard_message(row: ThreadSummary | None) -> str:
+    if row is None:
+        return bi("请先选中一个线程。", "Select a thread first.")
+    if row.inspect_status != "no_open_turn":
+        return bi(
+            "这条线程当前还有 open turn。现在重载前端风险很高，先不要用重载按钮。",
+            "This thread still has an open turn. Reloading the frontend is risky right now, so do not use the reload buttons yet.",
+        )
+    if row.compact_state_kind != "success":
+        return bi(
+            "这条线程后台还没有明确出现 compact 成功记录，现在不应该重载前端。",
+            "This thread does not yet have a confirmed backend compact success, so the frontend should not be reloaded.",
+        )
+    if not row.frontend_sync_label:
+        return bi(
+            "这条线程目前不符合“后台已好但前端没刷新”的条件，先不要用重载按钮。",
+            "This thread does not currently match the 'backend healed but frontend stale' case, so do not use the reload buttons yet.",
+        )
+    return ""
 
 
 def assess_thread_risk(
@@ -857,33 +996,103 @@ def run_compact_assist(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     settle_seconds: int = DEFAULT_COMPACT_SETTLE_SECONDS,
     poll_interval_seconds: int = 3,
+    allow_model_fallback: bool = True,
 ) -> dict:
     rollout_path = Path(thread.rollout_path)
     attempts: list[dict] = []
     after = inspect_thread(thread.raw_thread, rollout_path)
+
+    if not allow_model_fallback:
+        same_model = (thread.model or "").strip() or (thread.raw_thread.get("model") or "").strip() or "gpt-5.5"
+        external_result = run_external_compact_fallback(
+            codex_home=codex_home,
+            thread_id=thread.thread_id,
+            fallback_model=same_model,
+            timeout_seconds=120,
+            output_dir=output_dir,
+        )
+        after = inspect_thread(thread.raw_thread, rollout_path)
+        compact_outcome = (external_result.get("compact_outcome") or {})
+        compact_succeeded = bool(
+            external_result.get("status") == "compact_succeeded" or compact_outcome.get("ok")
+        )
+        started_compaction = any(
+            ((n.get("method") == "item/started") and (((n.get("params") or {}).get("item") or {}).get("type") == "contextCompaction"))
+            for n in (compact_outcome.get("notifications") or [])
+        )
+        settle_probes: list[dict] = []
+        if after["status"] == "orphan_task_started" and started_compaction and settle_seconds > 0:
+            deadline = time.time() + max(0, settle_seconds)
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                time.sleep(min(max(0.2, poll_interval_seconds), remaining))
+                probe = inspect_thread(thread.raw_thread, rollout_path)
+                settle_probes.append(
+                    {
+                        "status": probe["status"],
+                        "open_turns": probe.get("open_turns") or [],
+                    }
+                )
+                after = probe
+                if after["status"] != "orphan_task_started":
+                    break
+
+        external_attempt = {
+            "mode": "external_same_model_compact",
+            "compact_model": same_model,
+            "external_result": external_result,
+            "compact_succeeded": compact_succeeded,
+            "started_compaction": started_compaction,
+            "settle_probes": settle_probes,
+            "after_status": after["status"],
+            "after_open_turns": after.get("open_turns") or [],
+            "ok": after["status"] != "orphan_task_started" or compact_succeeded,
+        }
+        attempts.append(external_attempt)
+
+        same_model_status = "same_model_compact_failed"
+        compact_outcome_status = (compact_outcome.get("status") or "").strip()
+        if external_attempt["ok"]:
+            same_model_status = "same_model_compact_succeeded"
+        elif compact_outcome_status == "timeout_waiting_compact" and started_compaction:
+            same_model_status = "same_model_compact_hung_after_request"
+
+        result = {
+            "mode": "compact_assist",
+            "thread_id": thread.thread_id,
+            "title": thread.title,
+            "after_status": after["status"],
+            "after_open_turns": after.get("open_turns") or [],
+            "attempts": attempts,
+            "ok": bool(external_attempt["ok"]),
+            "status": same_model_status,
+        }
+        append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
+        return result
+
     if is_codex_running():
         request_started_ms = int(time.time() * 1000)
+        request_started_s = max(0, int(request_started_ms / 1000) - 1)
         live_compact = run_live_compact(
             thread_id=thread.thread_id,
             node_command=node_command,
             timeout_ms=timeout_ms,
         )
         compact_state = load_thread_compact_state(codex_home, thread.thread_id, rollout_path)
+        recent_trace = load_recent_compact_trace(codex_home, thread.thread_id, request_started_s)
         settle_probes: list[dict] = []
         deadline = time.time() + max(0, settle_seconds)
         while time.time() < deadline:
-            recent_success = bool(
-                compact_state.get("kind") == "success"
-                and compact_state.get("timestamp_ms")
-                and int(compact_state["timestamp_ms"]) >= request_started_ms - 2000
-            )
-            if after["status"] != "orphan_task_started" or recent_success:
+            recent_success = recent_trace.get("kind") == "success"
+            recent_failure = recent_trace.get("kind") == "failure"
+            if recent_success or recent_failure:
                 break
 
             remaining = deadline - time.time()
             time.sleep(min(max(0.2, poll_interval_seconds), remaining))
             after = inspect_thread(thread.raw_thread, rollout_path)
             compact_state = load_thread_compact_state(codex_home, thread.thread_id, rollout_path)
+            recent_trace = load_recent_compact_trace(codex_home, thread.thread_id, request_started_s)
             settle_probes.append(
                 {
                     "status": after["status"],
@@ -891,22 +1100,21 @@ def run_compact_assist(
                     "compact_state_kind": compact_state.get("kind"),
                     "compact_state_label": compact_state.get("label"),
                     "compact_state_time_text": compact_state.get("time_text"),
+                    "recent_trace_kind": recent_trace.get("kind"),
+                    "recent_trace_detail": recent_trace.get("detail"),
                 }
             )
 
-        recent_success = bool(
-            compact_state.get("kind") == "success"
-            and compact_state.get("timestamp_ms")
-            and int(compact_state["timestamp_ms"]) >= request_started_ms - 2000
-        )
+        recent_success = recent_trace.get("kind") == "success"
         live_attempt = {
             "mode": "live_compact",
             "live_compact": live_compact,
             "compact_state": compact_state,
+            "recent_trace": recent_trace,
             "settle_probes": settle_probes,
             "after_status": after["status"],
             "after_open_turns": after.get("open_turns") or [],
-            "ok": bool(live_compact.get("ok") and (recent_success or after["status"] != "orphan_task_started")),
+            "ok": bool(live_compact.get("ok") and recent_success and after["status"] != "orphan_task_started"),
         }
         attempts.append(live_attempt)
         if live_attempt["ok"]:
@@ -918,6 +1126,7 @@ def run_compact_assist(
                 "after_open_turns": after.get("open_turns") or [],
                 "attempts": attempts,
                 "ok": True,
+                "status": "same_model_compact_succeeded",
             }
             append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
             return result
@@ -977,6 +1186,98 @@ def run_compact_assist(
         "after_open_turns": after.get("open_turns") or [],
         "attempts": attempts,
         "ok": bool(attempts and attempts[-1].get("ok")),
+        "status": "fallback_compact_succeeded" if bool(attempts and attempts[-1].get("ok")) else "fallback_compact_failed",
+    }
+    append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
+    return result
+
+
+def run_same_model_manual_compact_trigger(
+    *,
+    codex_home: Path,
+    thread: ThreadSummary,
+    output_dir: Path,
+    node_command: str = "node",
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    observe_seconds: int = 12,
+    poll_interval_seconds: float = 0.75,
+) -> dict:
+    rollout_path = Path(thread.rollout_path)
+    request_started_ms = int(time.time() * 1000)
+    request_started_s = max(0, int(request_started_ms / 1000) - 1)
+    same_model = (thread.model or "").strip() or (thread.raw_thread.get("model") or "").strip() or "gpt-5.5"
+    before = inspect_thread(thread.raw_thread, rollout_path)
+    live_compact = run_live_compact(
+        thread_id=thread.thread_id,
+        node_command=node_command,
+        timeout_ms=timeout_ms,
+    )
+
+    trigger_probes: list[dict] = []
+    recent_trace = load_recent_compact_trace(codex_home, thread.thread_id, request_started_s)
+    compact_state = load_thread_compact_state(codex_home, thread.thread_id, rollout_path)
+    after = inspect_thread(thread.raw_thread, rollout_path)
+
+    deadline = time.time() + max(3, observe_seconds)
+    while time.time() < deadline:
+        compact_ts = compact_state.get("timestamp_ms")
+        fresh_compact_state = bool(compact_ts and compact_ts >= request_started_ms)
+        trace_kind = recent_trace.get("kind")
+        if trace_kind in {"activity", "success", "failure"} or fresh_compact_state:
+            break
+
+        remaining = deadline - time.time()
+        time.sleep(min(max(0.2, poll_interval_seconds), remaining))
+        after = inspect_thread(thread.raw_thread, rollout_path)
+        recent_trace = load_recent_compact_trace(codex_home, thread.thread_id, request_started_s)
+        compact_state = load_thread_compact_state(codex_home, thread.thread_id, rollout_path)
+        trigger_probes.append(
+            {
+                "status": after["status"],
+                "open_turns": after.get("open_turns") or [],
+                "recent_trace_kind": recent_trace.get("kind"),
+                "recent_trace_detail": recent_trace.get("detail"),
+                "compact_state_kind": compact_state.get("kind"),
+                "compact_state_time_text": compact_state.get("time_text"),
+            }
+        )
+
+    compact_ts = compact_state.get("timestamp_ms")
+    fresh_compact_state = bool(compact_ts and compact_ts >= request_started_ms)
+    trace_kind = recent_trace.get("kind")
+
+    started = bool(trace_kind in {"activity", "success"} or fresh_compact_state)
+    completed = bool(trace_kind == "success" or (fresh_compact_state and compact_state.get("kind") == "success"))
+    failed = bool(trace_kind == "failure" or (fresh_compact_state and compact_state.get("kind") == "failure"))
+
+    status = "same_model_compact_no_activity"
+    ok = False
+    if not live_compact.get("ok"):
+        status = "same_model_compact_trigger_failed"
+    elif failed:
+        status = "same_model_compact_failed_after_request"
+    elif completed:
+        status = "same_model_compact_completed"
+        ok = True
+    elif started:
+        status = "same_model_compact_started"
+        ok = True
+
+    result = {
+        "mode": "same_model_manual_compact_trigger",
+        "thread_id": thread.thread_id,
+        "title": thread.title,
+        "requested_model": same_model,
+        "before_status": before["status"],
+        "before_open_turns": before.get("open_turns") or [],
+        "after_status": after["status"],
+        "after_open_turns": after.get("open_turns") or [],
+        "live_compact": live_compact,
+        "recent_trace": recent_trace,
+        "compact_state": compact_state,
+        "trigger_probes": trigger_probes,
+        "ok": ok,
+        "status": status,
     }
     append_jsonl(output_dir / "gui_actions.jsonl", {"timestamp": utc_timestamp(), **result})
     return result
@@ -1323,6 +1624,19 @@ class RescueApp:
 
     def run_background(self, action_text: str, func, callback) -> None:
         if self.busy:
+            self.status_var.set(
+                bi(
+                    "工具正在执行上一项操作，请等状态栏恢复后再点一次。",
+                    "The tool is still busy with the previous action. Wait for the status bar to return before clicking again.",
+                )
+            )
+            messagebox.showinfo(
+                APP_TITLE,
+                bi(
+                    "当前还有一个操作在运行，所以这次点击没有开始新任务。",
+                    "Another operation is still running, so this click did not start a new task.",
+                ),
+            )
             return
 
         self.set_busy(True, action_text)
@@ -1594,17 +1908,17 @@ class RescueApp:
         settle_seconds = max(0, int(self.settle_seconds_var.get() or DEFAULT_SETTLE_SECONDS))
 
         def task():
-            result = run_compact_assist(
+            result = run_same_model_manual_compact_trigger(
                 codex_home=codex_home,
                 thread=row,
                 output_dir=output_dir,
                 node_command=node_command,
                 timeout_ms=timeout_ms,
-                settle_seconds=max(DEFAULT_COMPACT_SETTLE_SECONDS, settle_seconds),
+                observe_seconds=max(8, settle_seconds),
             )
             return {
                 "timestamp": utc_timestamp(),
-                "mode": "manual_compact_then_fallback",
+                "mode": "manual_same_model_compact",
                 "thread_id": row.thread_id,
                 "title": row.title,
                 "result": result,
@@ -1620,19 +1934,10 @@ class RescueApp:
 
     def on_manual_compact_complete(self, payload: dict) -> None:
         result = payload.get("result") or {}
-        attempts = result.get("attempts") or []
-        last_attempt = attempts[-1] if attempts else {}
-        outcome = (
-            ((last_attempt.get("live_compact") or {}).get("payload") or {}).get("status")
-            or ((last_attempt.get("external_result") or {}).get("compact_outcome") or {}).get("status")
-            or ((last_attempt.get("external_result") or {}).get("compact_outcome") or {}).get("kind")
-            or "-"
-        )
         status = result.get("status", "unknown")
         after_status = payload.get("after_status") or result.get("after_status") or "-"
-        self.status_var.set(
-            f"{bi('手动压缩完成', 'Manual compaction finished')}: {status} / {outcome} / {bi('后置状态', 'After')}: {after_status}"
-        )
+        trace_kind = ((result.get("recent_trace") or {}).get("kind") or "-")
+        self.status_var.set(f"{bi('手动压缩结果', 'Manual compaction result')}: {status} / {trace_kind} / {bi('后置状态', 'After')}: {after_status}")
 
         self.details.configure(state="normal")
         self.details.insert(
@@ -1643,51 +1948,73 @@ class RescueApp:
         self.details.configure(state="disabled")
 
         compact_ok = bool(result.get("ok"))
-        if compact_ok and after_status == "no_open_turn":
+        if status == "same_model_compact_started":
             messagebox.showinfo(
                 APP_TITLE,
                 bi(
-                    "后台压缩已经完成。如果聊天页还是旧画面，先点‘软刷新前端’；如果还不变，再点‘只重载界面层’。",
-                    "The backend compaction has finished. If the chat page is still stale, use Soft Reload UI first; if that still does not sync it, use Restart Renderer Only.",
+                    "同模型手动压缩已经真正触发。现在 Codex 里应该会出现“正在压缩上下文”。这个按钮只负责触发同模型压缩，不会等它完全结束。",
+                    "The same-model manual compaction was triggered for real. Codex should now show 'Compressing context'. This button only triggers the same-model compact and does not wait for full completion.",
+                ),
+            )
+        elif status == "same_model_compact_completed":
+            messagebox.showinfo(
+                APP_TITLE,
+                bi(
+                    "这次同模型压缩已经完成。如果聊天页还是旧画面，更像是前端没有同步。",
+                    "This same-model compaction has already completed. If the chat page is still stale, that is more likely a frontend sync issue.",
+                ),
+            )
+        elif compact_ok and after_status == "no_open_turn":
+            messagebox.showinfo(
+                APP_TITLE,
+                bi(
+                    "后台压缩已经完成。如果聊天页还是旧画面，这更像是前端没同步。当前版本先不要再用工具里的重载按钮，以免触发 `mismatched path`。",
+                    "The backend compaction has finished. If the chat page is still stale, that is more likely a frontend sync issue. In the current version, do not use the GUI reload buttons again because they can trigger `mismatched path`.",
+                ),
+            )
+        elif status == "same_model_compact_failed_after_request":
+            messagebox.showwarning(
+                APP_TITLE,
+                bi(
+                    "这次同模型压缩已经真正发到了 `/responses/compact`，但它没有成功收尾。",
+                    "This same-model compact attempt really reached `/responses/compact`, but it did not complete successfully.",
+                ),
+            )
+        elif status == "same_model_compact_no_activity":
+            messagebox.showwarning(
+                APP_TITLE,
+                bi(
+                    "这次按钮点击没有看到新的 compact 活动，说明桌面端这次没有真正开始同模型压缩。",
+                    "This click did not produce new compact activity, which means the desktop did not actually start a same-model compact this time.",
+                ),
+            )
+        elif status == "same_model_compact_trigger_failed":
+            messagebox.showwarning(
+                APP_TITLE,
+                bi(
+                    "这次按钮点击没有成功触发桌面端的同模型压缩请求。",
+                    "This click did not successfully trigger the desktop same-model compact request.",
                 ),
             )
 
         self.refresh_threads()
     def soft_reload_ui(self) -> None:
         row = self.selected_row()
-        if row and row.inspect_status == "orphan_task_started":
-            proceed = messagebox.askyesno(
-                APP_TITLE,
-                bi(
-                    "当前选中线程仍然显示有 open turn。软刷新前端更适合“后台已好但页面没刷新”的情况。\n\n仍然继续吗？",
-                    "The selected thread still has an open turn. Soft Reload UI is mainly for when the backend is already healed but the page stayed stale.\n\nDo you want to continue anyway?",
-                ),
-            )
-            if not proceed:
-                return
-
-        self.run_background(
-            bi("正在软刷新 Codex 前端...", "Sending a soft Codex UI reload..."),
-            soft_reload_codex_ui,
-            self.on_soft_reload_complete,
-        )
-
-    def restart_renderer_only(self) -> None:
-        proceed = messagebox.askyesno(
-            APP_TITLE,
-            bi(
-                "这一步只会重载 Codex 的界面层，不会重启整个 App。\n\n如果终端任务已经跑完，但聊天页还是旧画面，这通常是下一步。\n\n继续吗？",
-                "This reloads only the Codex UI layer, not the whole app.\n\nUse it when terminal work is done but the chat page is still stale.\n\nContinue?",
-            ),
-        )
-        if not proceed:
+        reason = frontend_reload_guard_message(row)
+        if reason:
+            messagebox.showwarning(APP_TITLE, reason + "\n\n" + RELOAD_DISABLED_TIP)
             return
 
-        self.run_background(
-            bi("正在重载 Codex 界面层...", "Restarting the Codex renderer only..."),
-            restart_codex_renderer_only,
-            self.on_renderer_restart_complete,
-        )
+        messagebox.showwarning(APP_TITLE, RELOAD_DISABLED_TIP)
+
+    def restart_renderer_only(self) -> None:
+        row = self.selected_row()
+        reason = frontend_reload_guard_message(row)
+        if reason:
+            messagebox.showwarning(APP_TITLE, reason + "\n\n" + RELOAD_DISABLED_TIP)
+            return
+
+        messagebox.showwarning(APP_TITLE, RELOAD_DISABLED_TIP)
 
     def on_soft_reload_complete(self, payload: dict) -> None:
         self.status_var.set(bi("已发送软刷新前端", "Soft Reload UI sent"))

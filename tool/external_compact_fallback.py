@@ -20,6 +20,15 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def desktop_path(value: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.startswith("\\\\?\\"):
+        text = text[4:]
+    return text.replace("/", "\\")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Resume a thread in an independent local app-server with a fallback model, then trigger compact."
@@ -338,6 +347,8 @@ def run_external_compact_fallback(
     codex_home = Path(codex_home).expanduser()
     output_dir = ensure_output_dir(codex_home, str(output_dir) if output_dir else "")
     thread = load_thread_row(codex_home, thread_id)
+    resume_path = desktop_path(thread.get("rollout_path"))
+    resume_cwd = desktop_path(thread.get("cwd"))
     result = {
         "timestamp": now_iso(),
         "thread_id": thread_id,
@@ -350,6 +361,8 @@ def run_external_compact_fallback(
             "reasoning_effort": thread.get("reasoning_effort"),
             "cwd": thread.get("cwd"),
             "rollout_path": thread.get("rollout_path"),
+            "resume_cwd": resume_cwd,
+            "resume_path": resume_path,
         },
     }
 
@@ -378,10 +391,10 @@ def run_external_compact_fallback(
             {
                 "threadId": thread_id,
                 "history": None,
-                "path": None,
+                "path": resume_path,
                 "model": fallback_model,
                 "modelProvider": None,
-                "cwd": thread.get("cwd"),
+                "cwd": resume_cwd,
                 "approvalPolicy": None,
                 "sandbox": None,
                 "config": None,

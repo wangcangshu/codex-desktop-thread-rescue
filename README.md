@@ -1,103 +1,75 @@
 # Codex Desktop Thread Rescue
 
-Local GUI workaround for one specific Codex Desktop problem:
+**Last Updated / 最近更新：`2026-05-04`**
 
-`the conversation gets stuck on "Automatically compacting context" and stops responding`
+Local GUI repair tool for one specific Codex Desktop problem:
 
-This project is not an official fix. It is a local recovery tool that tries to rescue the original thread without forcing a full app restart.
+`the conversation gets stuck on "Automatically compacting context" or "Compressing context" and does not recover cleanly`
 
-## What Problem This Targets
+This is not an official fix. It is a local recovery tool.
 
-This tool is focused on a very specific Codex Desktop failure mode:
+## Update Note / 更新说明
 
-- the desktop chat stays on `Automatically compacting context`
-- the thread looks frozen for minutes or hours
-- the terminal may still work while the desktop chat page is stale
-- restarting, branching, or switching models may sometimes help, but not reliably
+### English
 
-## What We Found
+After several recent Codex Desktop updates, the desktop `manual compact / resume / follower` chain became more fragile.
 
-On this machine, the failure pattern was not just "large context" and not just "bad network".
+The main failure was not that same-model compaction disappeared. The real problem was that desktop compaction sessions could enter a `started but not finalized` state: the compact request was sent, but the session did not close cleanly and the frontend did not return to a stable state.
 
-The most useful working theory became:
+That is why:
 
-1. A long thread triggers compaction.
-2. Sometimes the backend compaction does finish, but the desktop page does not refresh.
-3. Sometimes the compaction path itself fails, especially around `gpt-5.5` compact handling.
-4. In those cases, `interrupt` alone is often not enough anymore.
+- the official stuck auto-compaction bug was still not truly fixed
+- the external recovery entry point this tool relied on also became unstable
+- it looked like the repair tool had stopped working
 
-One important detail:
+What was repaired here was not the model capability itself. The repair was to restore the broken compaction session path, so a stuck compact request can be relaunched from a clean execution session.
 
-- terminal/manual compaction can sometimes succeed on the original model with no model switch
-- but the desktop page may still fail to update
-- when that happens, the missing step is often UI sync, not more interruption
+Current status:
 
-## Current Repair Order
+- same-model manual compaction works again
+- the external recovery entry point works again
+- the tool can bypass a broken desktop compaction session and relaunch compaction cleanly
 
-The tool now follows this order:
+### 中文
 
-1. `Manual Compact (Same Model First)`
-   This tries the closest path to terminal/manual compaction first.
-2. `5.4 Fallback Compact`
-   If the compact path looks like a `gpt-5.5`-specific compact failure, the tool can retry the compact step with `gpt-5.4`.
-3. `Soft Reload UI`
-   Use this when the backend looks healed but the chat page is still stale.
-4. `Restart Renderer Only`
-   Use this when the terminal work is already done, but the current chat page still does not sync.
-5. `Interrupt / fallback patch repair`
-   This is now a later fallback, not the first thing to try.
+最近几次 Codex Desktop 更新后，桌面端的 `manual compact / resume / follower` 链路变得更脆弱了。
 
-## Why Interrupt Alone Is No Longer Enough
+这次真正坏掉的，不是同模型压缩能力本身，而是桌面端的压缩会话更容易进入一种 `started but not finalized` 的坏状态：压缩请求已经发出，但会话没有正常收尾，前端也没有正确回到稳定状态。
 
-For the newer `gpt-5.5` cases we observed:
+这也是为什么：
 
-- the thread may not be "purely stuck" in the old sense
-- the real issue may be a failed compact path or a compact that succeeded without page sync
-- interrupt can clear some situations, but it can also be the wrong first move
+- 官方“自动压缩上下文卡住”的老问题并没有真正修好
+- 这个工具原本依赖的外部修复入口也一起变得不稳定
+- 表面看起来像是修复工具失效了
 
-So the tool no longer treats interruption as the primary action.
+这次修好的，不是模型能力本身，而是这条已经卡住的压缩会话链。现在工具可以把卡死的压缩请求从坏掉的桌面会话里摘出来，再从一个干净的执行会话里重新发起。
 
-## Buttons In The GUI
+当前状态：
+
+- 同模型手动压缩已恢复可用
+- 外部修复入口已恢复可用
+- 工具现在可以绕过坏掉的桌面压缩会话，重新拉起这次压缩
+
+## What This Tool Does
+
+- Inspect recent Codex Desktop threads
+- Detect likely stuck compaction states
+- Trigger same-model manual compaction first
+- Use an external recovery path when the desktop compaction session is poisoned
+- Avoid dangerous frontend reload actions that can break thread resume
+
+## Main Buttons
 
 - `Manual Compact (Same Model First)`
-  Use this first when a thread is stuck on automatic compaction.
+  Use this first when a thread is near or already stuck in compaction.
 
 - `5.4 Fallback Compact`
-  Use this when same-model manual compact does not help, or when the compact path looks like a `gpt-5.5` compact failure.
-
-- `Soft Reload UI`
-  Use this when the backend looks healed but the chat page still shows the old compaction state.
-
-- `Restart Renderer Only`
-  Use this when the chat page still does not update after a soft reload, and terminal work is already finished.
+  Use this only when the compact session itself is unhealthy and same-model recovery is not enough.
 
 - `Repair Selected`
-  Runs the broader repair flow with fallbacks.
-
-## Practical Workflow
-
-Use this order in practice:
-
-1. Refresh the thread list.
-2. If the thread has been stuck for around 3 minutes, try `Manual Compact (Same Model First)`.
-3. If that does not help, try `5.4 Fallback Compact`.
-4. If the backend is healed but the page is still stale, try `Soft Reload UI`.
-5. If that still does not sync the page, try `Restart Renderer Only`.
-6. Only after that, use the heavier repair path.
-
-## Important Note About Frontend Sync
-
-If a compact really succeeded in the backend but the chat page still looks frozen:
-
-- do not assume the compact failed
-- do not immediately restart the whole app
-- use the frontend sync actions first
-
-That distinction matters. A stale page and a failed compact are not the same problem.
+  Runs the broader repair flow.
 
 ## Launch
-
-Run from the project root:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
@@ -112,11 +84,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tool\run_rescue_gui.ps1
 - `tool/unstick_thread.py`
 - `tool/codex_ipc_control.js`
 
-## Limitations
+## Limits
 
-- this is a local workaround, not an official Codex fix
-- it does not patch the Codex application itself
-- it may help many stuck-thread cases, but not all of them
-- I cannot promise it will work on every machine or network setup
-
-If it does not solve your setup, I am sorry. The goal is to provide a practical recovery path and a clearer troubleshooting direction.
+- This is a workaround, not an official Codex patch.
+- It does not modify the Codex application binary.
+- It may help many stuck-thread cases, but not all of them.
