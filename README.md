@@ -1,6 +1,4 @@
-# Codex Desktop Thread Rescue
-
-**Last Updated / 最近更新：`2026-05-04`**
+# Codex Desktop Thread Rescue (Updated 2026-05-04 / 最近更新 2026-05-04)
 
 Local GUI repair tool for one specific Codex Desktop problem:
 
